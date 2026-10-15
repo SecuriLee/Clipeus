@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipeus"
+dynamic = ["version"]
+description = "External attack-surface audit & subdomain enumeration toolkit (DNS, TLS, mail-auth, subdomain-takeover posture)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Lee Mössner" }]
+keywords = ["security", "attack-surface", "dns", "tls", "subdomain-takeover", "recon", "osint"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+dependencies = [
+    "requests>=2.34",
+    "dnspython>=2.8",
+    "idna>=3.19",
+    "cryptography>=50.0",
+    "tldextract>=5.3",
+    "requests-file>=3.0",
+    "pyjarm>=0.0.5",
+]
+
+[project.scripts]
+clipeus = "clipeus:main"
+
+[project.urls]
+Homepage = "https://github.com/SecuriLee/Clipeus"
+Source = "https://github.com/SecuriLee/Clipeus"
+
+[tool.setuptools.dynamic]
+version = {attr = "clipeus.__version__"}
+
+[tool.setuptools]
+py-modules = ["clipeus", "brand_config", "classify"]

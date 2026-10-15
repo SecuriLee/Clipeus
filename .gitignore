@@ -1,0 +1,20 @@
+# Engagement secrets — NEVER commit real brand/engagement policy
+brand.json
+.config/clipeus/
+
+# Local operator tuning (ship only the .example.json)
+clipeus.tuning.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Run outputs / evidence
+out/
+evidence/
+*.jsonl
+*.csv
+!brand.example.json

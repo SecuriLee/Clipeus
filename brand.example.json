@@ -1,0 +1,23 @@
+{
+  "approved_mx": [
+    "example.com"
+  ],
+  "approved_redirect": [
+    "example.com"
+  ],
+  "brand_keywords": [],
+  "resolvers": [
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4"
+  ],
+  "org_networks": [
+    "192.0.2.0/24",
+    "2001:db8::/32"
+  ],
+  "nsec3": {
+    "zone": "",
+    "known": []
+  }
+}
