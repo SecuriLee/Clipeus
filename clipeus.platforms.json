@@ -1,0 +1,52 @@
+{
+  "_comment": "Platform currency rules for the platform_risk column. Policy lives here, not in the code: edit or override with $CLIPEUS_PLATFORMS or ~/.config/clipeus/platforms.json. Version strings are indicative only: vendors and distributions backport fixes, so confirm before treating a hit as vulnerable.",
+  "_as_of": "2026-10",
+  "eol_cycles": {
+    "PHP": {
+      "older_than_first_is_eol": true,
+      "cycles": [
+        {"cycle": "7.4", "eol": "2022-11-28"},
+        {"cycle": "8.0", "eol": "2023-11-26"},
+        {"cycle": "8.1", "eol": "2025-12-31"},
+        {"cycle": "8.2", "eol": "2026-12-31"},
+        {"cycle": "8.3", "eol": "2027-12-31"},
+        {"cycle": "8.4", "eol": "2028-12-31"},
+        {"cycle": "8.5", "eol": "2029-12-31"}
+      ]
+    },
+    "IIS": {
+      "older_than_first_is_eol": true,
+      "cycles": [
+        {"cycle": "7.5", "eol": "2020-01-14"},
+        {"cycle": "8.0", "eol": "2023-10-10"},
+        {"cycle": "8.5", "eol": "2023-10-10"}
+      ]
+    },
+    "Apache": {
+      "older_than_first_is_eol": true,
+      "cycles": [{"cycle": "2.4", "eol": "2099-12-31"}]
+    }
+  },
+  "min_version": [
+    {"product": "jQuery", "min": "3.5.0", "reason": "known XSS flaws (CVE-2020-11022/11023), and the 1.x and 2.x branches are unmaintained"}
+  ],
+  "unmaintained": [
+    {"product": "nginx", "version_prefix": "1.18.", "reason": "2020 release (Ubuntu 20.04 package, out of standard support)"},
+    {"product": "nginx", "version_prefix": "1.14.", "reason": "2018 release"},
+    {"product": "Apache", "version_prefix": "2.4.6", "reason": "2013 release (RHEL/CentOS 7 era)", "exact": true},
+    {"product": "lighttpd", "version_prefix": "1.4.28", "reason": "2011 release"},
+    {"product": "LayerSlider", "version_prefix": "6.", "reason": "2020-era WordPress slider plugin with a history of vulnerabilities"}
+  ],
+  "non_enterprise": [
+    {"match": "IdeaWebServer", "reason": "JetBrains IDE built-in web server: a developer tool, not a production server"},
+    {"match": "Plesk", "reason": "shared-hosting control panel"},
+    {"match": "cPanel", "reason": "shared-hosting control panel"},
+    {"match": "Vesta", "reason": "small-host control panel"},
+    {"match": "Webmin", "reason": "server admin panel exposed to the internet"},
+    {"match": "WP Engine", "reason": "consumer/SMB managed WordPress hosting"},
+    {"match": "Wix", "reason": "consumer website builder"},
+    {"match": "Squarespace", "reason": "consumer website builder"},
+    {"match": "Weebly", "reason": "consumer website builder"},
+    {"match": "Jimdo", "reason": "consumer website builder"}
+  ]
+}

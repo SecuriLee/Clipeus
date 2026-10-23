@@ -1,0 +1,57 @@
+{
+  "__doc__": "Operator-editable policy, kept OUT of the code. Copy to clipeus.tuning.json (beside clipeus.py), or point $CLIPEUS_TUNING at it, or drop it in ~/.config/clipeus/tuning.json. Any key you omit falls back to the in-code default, so a partial file is fine and the tool always runs standalone. Run `clipeus --show-config` to see what actually loaded. Brand/engagement policy (approved_mx, approved_redirect, brand_keywords, resolvers, nsec3) lives separately in brand.json / --config.",
+  "dns_servers": [
+    "1.1.1.1",
+    "1.0.0.1",
+    "8.8.8.8",
+    "8.8.4.4"
+  ],
+  "top_ports": [
+    21,
+    22,
+    23,
+    25,
+    53,
+    80,
+    110,
+    143,
+    443,
+    445,
+    993,
+    995,
+    1433,
+    3306,
+    3389,
+    5432,
+    6379,
+    8080,
+    8443
+  ],
+  "dkim_selectors": [
+    "default",
+    "google",
+    "selector1",
+    "selector2",
+    "k1",
+    "mail",
+    "dkim",
+    "smtp"
+  ],
+  "dkim_min_bits": 2048,
+  "hsts_min_max_age": 15552000,
+  "spf_max_queries": 30,
+  "scanner_points": {
+    "critical": 30,
+    "high": 20,
+    "medium": 10
+  },
+  "scanner_points_cap": 50,
+  "certspotter_max_wait": 200,
+  "nxdomain_only_providers": [
+    "trafficmanager.net",
+    "cloudapp.azure.com",
+    "blob.core.windows.net",
+    "azurecr.io"
+  ],
+  "max_body_bytes": 2097152
+}
