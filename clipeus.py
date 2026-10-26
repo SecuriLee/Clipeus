@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.10.1"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.10.2"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -1615,7 +1615,8 @@ def _load_platforms() -> dict:
         cand.append(os.environ["CLIPEUS_PLATFORMS"])
     _here = os.path.dirname(os.path.realpath(__file__))
     cand += [os.path.join(_here, "clipeus.platforms.json"),
-             os.path.expanduser("~/.config/clipeus/platforms.json")]
+             os.path.expanduser("~/.config/clipeus/platforms.json"),
+             os.path.join(sys.prefix, "share", "clipeus", "clipeus.platforms.json")]
     for _p in cand:
         try:
             if _p and os.path.isfile(_p):

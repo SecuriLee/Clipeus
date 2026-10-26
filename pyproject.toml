@@ -41,3 +41,6 @@ version = {attr = "clipeus.__version__"}
 
 [tool.setuptools]
 py-modules = ["clipeus", "brand_config", "classify"]
+
+[tool.setuptools.data-files]
+"share/clipeus" = ["clipeus.platforms.json"]
