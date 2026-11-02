@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.10.2"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.0"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -84,6 +84,7 @@ import dns.query
 import dns.zone
 import dns.message
 import dns.flags
+import dns.rcode
 
 try:
     from urllib3.util.retry import Retry
@@ -829,12 +830,16 @@ def get_dns_audit(domain: str, rec: AuditRecord) -> Dict[str, Any]:
 
 @lru_cache(maxsize=100000)
 def check_dnssec(domain: str) -> str:
-    """Ask a validating resolver; the AD (Authenticated Data) flag => DNSSEC-signed."""
+    """Ask a validating resolver; the AD (Authenticated Data) flag on an answer that
+    exists (NOERROR, including NODATA) => DNSSEC-signed."""
     try:
         q = dns.message.make_query(domain, "A", want_dnssec=True)
         for server in RESOLVER.nameservers:
             try:
                 r = dns.query.udp(q, server, timeout=3)
+                # An authenticated NXDOMAIN only proves the parent zone is signed
+                if r.rcode() == dns.rcode.NXDOMAIN:
+                    return "No"
                 return "Yes" if (r.flags & dns.flags.AD) else "No"
             except Exception:
                 continue
