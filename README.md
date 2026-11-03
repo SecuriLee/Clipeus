@@ -172,7 +172,9 @@ python3 clipeus.py --input big.txt --output big.jsonl --format jsonl \
 | `--jitter` | `0` | Random 0..N s delay before each domain |
 | `--ports` | `top` | `none`, `top` (~30), `standard` (1-1024+), `full` |
 | `--ports-behind-cdn` | off | Port-scan even when a CDN/WAF is detected (default skips) |
-| `--banners` | off | Grab TCP banners on open ports |
+| `--no-banners` | off | Don't read service banners on open ports (banners are read by default; without them every service in `port_services` is a port guess) |
+| `--roots FILE` | config `roots` | Portfolio roots, one per line; sets `root_domain` / `is_subdomain` |
+| `--no-manifest` | off | Don't write `<output>.manifest.json` (run provenance) |
 | `--harvest` | off | Harvest robots.txt / sitemap.xml / security.txt |
 | `--jarm` | off | Real JARM via external `jarm` tool |
 | `--ocsp` | off | OCSP stapling check via the `openssl` CLI (one extra handshake per host) |
@@ -285,9 +287,14 @@ Taken from the certificate and HTTPS response already fetched, so no extra reque
 - **Exposed services** — open ports are now scored and listed. `PORT_RISK` maps ports to a
   severity (critical 25 pts: telnet, SMB, Docker API; high 15: FTP, NFS, ZooKeeper, MSSQL,
   Oracle, MySQL, RDP, Postgres, VNC, WinRM, Redis, Elasticsearch, Memcached, MongoDB;
-  medium 8: cleartext POP3/IMAP, MQTT, Docker TLS, Webmin), capped at 40 total. Each shows up
-  as `exposed-<service>(<port>)` in `config_issues`. 11211 and 27017 joined the default port
-  list. Ports are still skipped behind a CDN unless `--ports-behind-cdn`.
+  medium 8: cleartext POP3/IMAP, MQTT, Docker TLS, Webmin), capped at 40 total. A port
+  number is not a service: `port_services` records what each open port is and how that is
+  known — `22:ssh(banner)` when the service identified itself, `10000:webmin?(port-guess)`
+  when only the port number suggests it. Confirmed services appear as
+  `exposed-<service>(<port>)` in `config_issues` and score in full; unconfirmed ones appear
+  as `exposed-<service>-unconfirmed(<port>)` and score half. A banner naming a different
+  service (a plain web server on 10000) removes the port from the list. Ports are still
+  skipped behind a CDN unless `--ports-behind-cdn`.
 - **Cookie flags** — `cookie_flags` lists each cookie as `name(!Secure,HttpOnly,SameSite=Lax)`
   (`!` = missing), read from every `Set-Cookie` in the redirect chain. Issues:
   `cookie-no-secure(...)` (set over HTTPS without `Secure`) and
@@ -369,7 +376,10 @@ Merge re-runs the classifier on the stored fields, so it works best on full Clip
 The diff is keyed by domain and reports new domains, domains missing from this run (removed
 **or** an incomplete run), issues gained and resolved, changes to `disposition`,
 `takeover_risk`, `dangling_status`, `origin_exposed`, `ports`, `cert_sha256`, `tls_valid`,
-`ns_servers` and `mx_records`, and risk moves of 10 points or more. The HTML report is one
+`ns_servers` and `mx_records`, and risk moves of 10 points or more. Counts are per
+hostname. An issue that disappears while this run could not look (DNS, TLS or HTTP timed
+out or errored, per `checks`) is listed as *not re-checked (transient)*, not as resolved;
+issues present in both runs are counted as persistent. The HTML report is one
 self-contained file (inline CSS/JS, no network, strict CSP, every value HTML-escaped):
 summary cards, disposition and common-issue charts, the 25 highest-risk hosts, and a
 filterable, sortable table (capped at the 5000 highest-risk rows).
@@ -381,7 +391,20 @@ filterable, sortable table (capped at the 5000 highest-risk rows).
 hostname CNAME and a plain-text fingerprint. To pick up newer entries without editing code,
 download its `fingerprints.json` and pass it with `--takeover-sigs`. Entries needing a regex
 or an HTTP-status match are skipped. Body matching now HTML-unescapes first (`&#39;`).
-Elastic Beanstalk moved to the NXDOMAIN-only class (a live app's 404 is no longer flagged).
+Elastic Beanstalk, Azure App Service (`azurewebsites.net`) and Azure CDN (`azureedge.net`)
+are in the NXDOMAIN-only class: a live app's 404 is not a takeover. Generic body signatures
+(`404`, `not found`, `bad request`, …) never produce `takeover_risk=Yes`; they are recorded
+as `Possibly` with the observation in `takeover_detail`.
+
+A takeover verdict is kept apart from its evidence:
+
+| Column | Meaning |
+|---|---|
+| `takeover_target_missing` | `Yes` (target NXDOMAIN) / `provider-unclaimed` (provider's own "no such site" page) / `No` |
+| `takeover_recreatable` | `released` where the provider is known to release deleted names, else `unknown` (tuning `takeover_name_policy`) |
+| `takeover_binding_protected` | `Yes` when the provider's hostname verification record exists (e.g. `asuid.<host>` for App Service), `No`, or `none-known` (tuning `takeover_binding_txt`) |
+| `takeover_confidence` | `High` (target gone, name released, no verification record) / `Medium` / `Low` |
+| `takeover_claim_verified` | always `No (manual)`: Clipeus never claims a resource |
 
 ## Origin discovery (`--origin`)
 
@@ -430,11 +453,20 @@ Two independent modes:
   days**, and status codes (`clientHold`, `pendingDelete`, …) over plain HTTPS,
   no dependency. The standout signal for freshly-registered look-alikes.
 - **Email auth** — SPF and DMARC parsing (policy strength, lookups, `pct`, `rua`),
-  with one-level parent DMARC inheritance.
-- **Dangling / takeover** — CNAME→NXDOMAIN/NoAnswer, unresolvable NS, and a
-  ~30-provider takeover fingerprint table matched against the live body.
-- **TLS** — health, **validity verdict** (valid / expired / hostname-mismatch /
-  self-signed / untrusted-chain), version range (1.0–1.3), **negotiated cipher**,
+  with DMARC inherited from the organizational domain (RFC 7489) and CAA inherited down
+  the tree (RFC 8659). An SPF record must start `v=spf1` followed by a space: TXT strings
+  split without spaces (`"v=spf1" "mx"` → `v=spf1mx`) are flagged `spf_malformed_version`,
+  and `spf_raw_chunks` shows the strings as published.
+- **Dangling / takeover** — judged on the name's **own** delegation, never the parent
+  zone's. `dangling_class`: `dangling-cname`, `dangling-delegation` (NS hosts gone),
+  `lame-delegation` (delegated servers do not answer), `unresponsive-cloud-ip` (cloud
+  address answering on no probed port) are suspect; `nxdomain`, `no-web-records`,
+  `dns-failure`, `ok` are not dangling. Plus a ~30-provider takeover fingerprint table.
+- **TLS** — each property judged on its own: `tls_handshake`, `tls_hostname`,
+  `tls_trust` (checked ignoring dates, so an expired chain still reports its trust),
+  `tls_dates`, `tls_protocol`; `cert_defects` lists every defect at once
+  (`expired;self-signed`); `tls_health` is `Healthy` only when all pass (else `Degraded`
+  / `Failed`); `tls_valid` keeps one label (worst defect first), version range (1.0–1.3), **negotiated cipher**,
   cert subject/issuer, **not-before / expiry / days-left**, **SHA-256 fingerprint**
   (cert pivot), **SANs**, optional real **JARM**.
 - **HTTP** — separate HTTP/HTTPS status, redirect quality + count, **latency**,
@@ -445,11 +477,35 @@ Two independent modes:
   `/api/vN` endpoints, HTML comments, copyright year, login-page detection (incl.
   Microsoft/Entra tenant ID).
 - **Network** — private-IP exposure, org-CIDR membership, open ports (auto-skipped
-  behind a CDN unless `--ports-behind-cdn`), optional **service banners**.
+  behind a CDN unless `--ports-behind-cdn`), **service banners**. Location is not
+  management: `network_owner` (ASN with `--geo`, else provider from PTR/CNAME),
+  `hosting_class` (`org` / `private` / `cdn` / `cloud` / `third-party` / `unknown`) and
+  `managed_by` (`org-network`, `org-provider(x)` for providers listed in config
+  `managed_providers`, else `not-verified` — never "unmanaged").
+- **Reachability** — `reachability` (`dns:ok;tcp:ok;tls:ok;http:200`) shows how far a
+  client gets; `private_endpoint` marks private IPs and Private Link names (tuning
+  `private_endpoint_markers`).
 - **Loop-back** — certificate SANs + external CNAME targets surfaced as
   `discovered_domains` / the `new-domains` emit feed for the next enum pass.
 - **Harvest** — robots.txt / sitemap.xml / security.txt disclosed paths.
-- **Risk score** — weighted 0–100 with a readable `score_notes` breakdown.
+- **Risk score** — weighted 0–100 with a readable `score_notes` breakdown, split into
+  `risk_exposure` (reachable or claimable) and `risk_hygiene` (missing hardening), with
+  `risk_confidence` (lower when points come from unconfirmed observations). Controls only
+  score where they apply: a name that does not exist gets no SPF/DMARC/CAA points, a
+  subdomain without MX no SPF/DMARC points.
+- **Check states** — `checks` records one state per check (`passed` / `failed` /
+  `not_applicable` / `not_run` / `timeout` / `error`), so "nothing found" and "never looked"
+  differ. `scanner_findings` is `not_run` when no `--ingest` was given.
+- **Provenance** — every record carries `scanned_at`, `clipeus_version`, `rules_version`
+  (hash of the takeover, port and platform rules) and `root_domain` (`is_subdomain` is
+  `Yes` below it). Each run writes `<output>.manifest.json`: version, rules, input and config
+  hashes, flags, resolvers and counts labelled by unit (hostnames, distinct IPs,
+  certificates, sites). `endpoint_ids` and `site_id` let a report count endpoints or sites
+  instead of hostnames.
+- **Header context** — `assessed_status` is the status of the graded response; missing
+  security headers are judged only on HTML (X-Frame-Options not required when CSP
+  `frame-ancestors` is set; the obsolete X-XSS-Protection is not required);
+  `cookie_context` names the URL that set each cookie (`*` = session-like name).
 
 ## Configuration
 
@@ -457,7 +513,9 @@ Two independent modes:
   `classify.py` read an optional JSON file — `--config FILE`, else `$CLIPEUS_CONFIG`, else
   `brand.json` beside `clipeus.py`, else `~/.config/clipeus/brand.json`. Keys (all optional):
   `approved_mx`, `approved_redirect`, `brand_keywords` (extra banking/finance signals for
-  `classify.py`), `resolvers` (DNS resolver IPs — see **DNS integrity** below), and
+  `classify.py`), `resolvers` (DNS resolver IPs — see **DNS integrity** below),
+  `managed_providers` (hosting providers the organisation runs services with),
+  `roots` (portfolio root domains for `root_domain` / `is_subdomain`), and
   `nsec3.zone` / `nsec3.known` (for `recon/nsec3-enum.py`). Copy
   `brand.example.json` to `brand.json` and fill it in; `brand.json` is gitignored so engagement
   values stay local. With no config (or an unset list), the matching policy check is simply
@@ -508,8 +566,8 @@ unmodified across engagements. Precedence, highest first:
 | Layer | How | What it holds |
 |---|---|---|
 | CLI flags | `--resolvers`, `--org-networks`, `--takeover-sigs`, `--ports`, … | per-run overrides |
-| Brand/engagement config | `--config FILE` · `$CLIPEUS_CONFIG` · `brand.json` beside `clipeus.py` · `~/.config/clipeus/brand.json` | `approved_mx`, `approved_redirect`, `brand_keywords`, `resolvers`, `org_networks`, `nsec3` (secret — gitignored) |
-| Tuning file | `$CLIPEUS_TUNING` · `clipeus.tuning.json` beside `clipeus.py` · `~/.config/clipeus/tuning.json` | operational policy: `dns_servers`, `top_ports`, `dkim_selectors`, `dkim_min_bits`, `hsts_min_max_age`, `spf_max_queries`, `scanner_points`, `nxdomain_only_providers`, `max_body_bytes` (per-response cap, default 2 MiB; cut bodies set `body_truncated=Yes`), … |
+| Brand/engagement config | `--config FILE` · `$CLIPEUS_CONFIG` · `brand.json` beside `clipeus.py` · `~/.config/clipeus/brand.json` | `approved_mx`, `approved_redirect`, `brand_keywords`, `resolvers`, `org_networks`, `managed_providers`, `roots`, `nsec3` (secret — gitignored) |
+| Tuning file | `$CLIPEUS_TUNING` · `clipeus.tuning.json` beside `clipeus.py` · `~/.config/clipeus/tuning.json` | operational policy: `dns_servers`, `top_ports`, `dkim_selectors`, `dkim_min_bits`, `hsts_min_max_age`, `spf_max_queries`, `scanner_points`, `nxdomain_only_providers`, `takeover_name_policy`, `takeover_binding_txt`, `cloud_provider_markers`, `private_endpoint_markers`, `max_body_bytes` (per-response cap, default 2 MiB; cut bodies set `body_truncated=Yes`), … |
 | In-code defaults | — | sane fallback so Clipeus always runs standalone |
 
 Any key you omit falls back to the layer below it; a missing file changes nothing.

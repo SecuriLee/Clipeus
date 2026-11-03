@@ -17,6 +17,11 @@ Schema (all keys optional; see brand.example.json):
                      (use unfiltered public resolvers; see README "DNS integrity")
   org_networks       list of CIDRs owned by the organisation; hosts resolving into them
                      are tagged first-party (org_range=Yes). Overridden by --org-networks.
+  managed_providers  hosting providers the organisation runs services with (e.g. "azure",
+                     "aws", a CDN name): hosts there get managed_by=org-provider(x) instead
+                     of not-verified. Network location alone never means "unmanaged".
+  roots              portfolio root domains; root_domain / is_subdomain use the longest
+                     matching root (default: each host's registrable domain). --roots FILE wins.
 """
 from __future__ import annotations
 
@@ -30,7 +35,8 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 # effective_resolvers() so DNS behaviour is one configuration item everywhere.
 DEFAULT_RESOLVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"]
 DEFAULTS: Dict[str, Any] = {"approved_mx": [], "approved_redirect": [], "brand_keywords": [],
-                            "resolvers": [], "org_networks": [], "nsec3": {"zone": "", "known": []}}
+                            "resolvers": [], "org_networks": [], "managed_providers": [], "roots": [],
+                            "nsec3": {"zone": "", "known": []}}
 
 
 def candidate_paths(explicit: Optional[str] = None) -> List[str]:
@@ -92,7 +98,7 @@ def load(explicit: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[str]]
             raise ValueError(f"{path}: {exc}")
         if not isinstance(data, dict):
             raise ValueError(f"{path}: top level must be an object")
-        for key in ("approved_mx", "approved_redirect", "brand_keywords"):
+        for key in ("approved_mx", "approved_redirect", "brand_keywords", "managed_providers", "roots"):
             if key in data:
                 cfg[key] = _str_list(data[key], key)
         if "resolvers" in data:

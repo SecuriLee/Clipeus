@@ -38,7 +38,7 @@
     {"product": "LayerSlider", "version_prefix": "6.", "reason": "2020-era WordPress slider plugin with a history of vulnerabilities"}
   ],
   "non_enterprise": [
-    {"match": "IdeaWebServer", "reason": "JetBrains IDE built-in web server: a developer tool, not a production server"},
+    {"match": "IdeaWebServer", "reason": "home.pl shared-hosting web server"},
     {"match": "Plesk", "reason": "shared-hosting control panel"},
     {"match": "cPanel", "reason": "shared-hosting control panel"},
     {"match": "Vesta", "reason": "small-host control panel"},

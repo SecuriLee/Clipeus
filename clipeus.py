@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.0"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.1"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -85,6 +85,7 @@ import dns.zone
 import dns.message
 import dns.flags
 import dns.rcode
+import dns.rdatatype
 
 try:
     from urllib3.util.retry import Retry
@@ -375,6 +376,7 @@ TAKEOVER_PROVIDERS = {
 # the provider itself serves the "no such site" fingerprint, so a body signature
 # IS the valid signal.
 NXDOMAIN_ONLY_PROVIDERS = (
+    "azurewebsites.net", "azureedge.net",
     "trafficmanager.net", "cloudapp.azure.com", "cloudapp.net", "elasticbeanstalk.com",
     "trydiscourse.com", "blob.core.windows.net", "azure-api.net", "azurehdinsight.net",
     "azurecontainer.io", "database.windows.net", "azuredatalakestore.net",
@@ -383,6 +385,29 @@ NXDOMAIN_ONLY_PROVIDERS = (
 # merge=True: a tuning file can ADD providers but never drop one, because dropping
 # a provider removes its NXDOMAIN gate and turns ordinary 404s into takeover findings.
 NXDOMAIN_ONLY_PROVIDERS = tuple(_tune("nxdomain_only_providers", list(NXDOMAIN_ONLY_PROVIDERS), merge=True))
+
+# Body signatures too generic to prove an unclaimed resource: any app can serve them.
+# A match is recorded as an observation (takeover_risk=Possibly), never as Yes.
+WEAK_TAKEOVER_SIGNATURES = {"404", "error 404", "page not found", "not found", "bad request"}
+
+# Can a deleted resource's provider name be registered again by anyone? "released" only
+# where that is the provider's documented behaviour; everything else stays "unknown"
+# until an analyst checks the provider (some reserve names, or offer unique hostnames).
+TAKEOVER_NAME_POLICY = {
+    "cloudapp.azure.com": "released", "cloudapp.net": "released",
+    "trafficmanager.net": "released", "elasticbeanstalk.com": "released",
+    "amazonaws.com": "released", "s3-website": "released",
+}
+TAKEOVER_NAME_POLICY.update(_tune("takeover_name_policy", {}))
+
+# Providers that require a DNS verification record before a custom hostname can be bound
+# to a new resource. If the record exists for this host, a stranger who recreates the
+# resource cannot attach the hostname. "{host}" is replaced by the audited name.
+TAKEOVER_BINDING_TXT = {
+    "azurewebsites.net": "asuid.{host}",
+    "azurefd.net": "_dnsauth.{host}",
+}
+TAKEOVER_BINDING_TXT.update(_tune("takeover_binding_txt", {}))
 
 RESOLVER = dns.resolver.Resolver()
 RESOLVER.nameservers = DNS_SERVERS
@@ -667,7 +692,7 @@ class AuditRecord:
     origin_exposed: str = "No"         # --origin: Yes (cert match) / Possibly / No
     origin_candidates: str = "None"    # --origin: ip(score=N;methods=a+b[;cert-match])
     disposition: str = "N/A"           # dead-dns/dead-nohttp/redirect-offsite/redirect-approved/parked/live
-    is_subdomain: str = "No"           # discovered via subdomain enumeration
+    is_subdomain: str = "No"           # Yes when the host is below its root_domain
     mx_approved: str = "N/A"           # Yes/No/None — does mail route via the approved domain
     independent_mail: str = "No"       # has its own MX not under the approved domain
     service_independent: str = "No"    # live service NOT redirecting to the approved domain
@@ -679,6 +704,38 @@ class AuditRecord:
     body_truncated: str = "No"   # Yes = response cut at MAX_BODY_BYTES / deadline
     technology: str = ""         # consolidated stack (see detect_technology); "; "-separated
     platform_risk: str = ""      # out-of-date / non-enterprise platforms (see assess_platforms)
+    # --- Appended in 26.11.1; every column above keeps its position and meaning. ---
+    root_domain: str = "N/A"           # portfolio root this host sits under (see host_root)
+    tls_handshake: str = "N/A"         # ok / failed / no-listener (nothing on 443)
+    tls_hostname: str = "N/A"          # pass / fail (certificate names vs this host)
+    tls_trust: str = "N/A"             # pass / self-signed / untrusted-chain / invalid
+    tls_dates: str = "N/A"             # pass / expired / not-yet-valid
+    tls_protocol: str = "N/A"          # pass / legacy(TLSv1.0) — lowest version accepted
+    cert_defects: str = "None"         # every certificate defect, not just the first: expired;self-signed
+    dangling_class: str = "N/A"        # see detect_dangling: nxdomain / no-web-records / dangling-cname ...
+    takeover_target_missing: str = "N/A"     # Yes / No — the provider resource behind the CNAME is gone
+    takeover_recreatable: str = "N/A"        # released / reserved / unknown (provider name policy)
+    takeover_binding_protected: str = "N/A"  # Yes (verification TXT present) / No / not-required / unknown
+    takeover_confidence: str = "N/A"         # High / Medium / Low
+    takeover_claim_verified: str = "N/A"     # "No (manual)": claiming is never attempted
+    port_services: str = "None"        # port:service(source); source = banner / port-guess
+    network_owner: str = "N/A"         # ASN (with --geo) or provider inferred from PTR / CNAME
+    hosting_class: str = "N/A"         # org / private / cdn / cloud / third-party / unknown
+    managed_by: str = "N/A"            # org-network / org-provider(x) / not-verified
+    reachability: str = "N/A"          # dns:ok;tcp:ok;tls:ok;http:200 — how far a client gets
+    private_endpoint: str = "No"       # Yes(reason) when the name points at a private endpoint
+    assessed_status: str = "N/A"       # HTTP status of the response whose headers/cookies were graded
+    cookie_context: str = "None"       # name@URL that set it (session-like cookies marked *)
+    spf_raw_chunks: str = "N/A"        # the TXT strings as published, when the SPF record is split
+    risk_exposure: int = 0             # risk_score part: reachable / claimable exposure
+    risk_hygiene: int = 0              # risk_score part: missing hardening
+    risk_confidence: str = "N/A"       # High / Medium / Low — how much of the score is confirmed
+    endpoint_ids: str = "None"         # ip:port endpoints observed for this host
+    site_id: str = "N/A"               # hash of final host + body: same site behind many names
+    checks: str = ""                   # check=state;... state = passed/failed/not_applicable/not_run/timeout/error
+    scanned_at: str = ""               # UTC time this record was produced
+    clipeus_version: str = ""
+    rules_version: str = ""            # hash of the takeover / port / platform rules in effect
 
 
 FIELDNAMES = [f.name for f in AuditRecord.__dataclass_fields__.values()]
@@ -704,6 +761,15 @@ def _resolve(domain: str, rtype: str) -> Tuple[str, ...]:
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers,
             dns.exception.Timeout):
         return ()
+    except Exception:
+        return ()
+
+
+def _resolve_txt_chunks(domain: str) -> Tuple[Tuple[str, ...], ...]:
+    """TXT records as the individual character-strings they were published in."""
+    try:
+        return tuple(tuple(s.decode("utf-8", "ignore") if isinstance(s, bytes) else s
+                           for s in r.strings) for r in RESOLVER.resolve(domain, "TXT"))
     except Exception:
         return ()
 
@@ -783,17 +849,26 @@ def get_dns_audit(domain: str, rec: AuditRecord) -> Dict[str, Any]:
         if wc and rec.ip in wc:
             rec.wildcard = "Yes"
 
+    # ns_servers keeps its meaning (NS of the closest enclosing zone, used for AXFR);
+    # own_ns is only the name's OWN delegation, which is what dangling checks may judge.
     ns_records: Tuple[str, ...] = ()
+    own_ns: Tuple[str, ...] = ()
+    zone = ""
     for i in range(len(parts) - 1):
         ns_records = _resolve(".".join(parts[i:]), "NS")
         if ns_records:
             rec.ns_servers = ",".join(sorted(ns_records))
+            zone = ".".join(parts[i:])
+            own_ns = ns_records if i == 0 else ()
             break
 
     txts = _resolve(domain, "TXT")
     spf_info = parse_spf(list(txts))
-    if spf_info["spf_present"]:
+    if spf_info["spf_record"]:
         rec.spf = spf_info["spf_record"]
+        chunks = next((c for c in _resolve_txt_chunks(domain) if "".join(c) == rec.spf), ())
+        if len(chunks) > 1:
+            rec.spf_raw_chunks = " ".join(json.dumps(c) for c in chunks)
     if spf_info["spf_issues"]:
         rec.spf_issues = ",".join(spf_info["spf_issues"])
     keys = [t[:20] + "..." for t in txts
@@ -801,10 +876,12 @@ def get_dns_audit(domain: str, rec: AuditRecord) -> Dict[str, Any]:
     if keys:
         rec.txt_entropy_keys = ",".join(keys[:3])
 
+    # DMARC falls back to the organizational domain (RFC 7489 6.6.3), not the parent.
     dmarc_txts = list(_resolve(f"_dmarc.{domain}", "TXT"))
     inherited = False
-    if not any(t.lower().startswith("v=dmarc1") for t in dmarc_txts) and len(parts) > 2:
-        parent = list(_resolve(f"_dmarc.{'.'.join(parts[1:])}", "TXT"))
+    org = registrable_domain(domain)
+    if not any(t.lower().startswith("v=dmarc1") for t in dmarc_txts) and org and org != domain:
+        parent = list(_resolve(f"_dmarc.{org}", "TXT"))
         if any(t.lower().startswith("v=dmarc1") for t in parent):
             dmarc_txts, inherited = parent, True
     dmarc_info = parse_dmarc(dmarc_txts)
@@ -819,12 +896,18 @@ def get_dns_audit(domain: str, rec: AuditRecord) -> Dict[str, Any]:
     soa = _resolve(domain, "SOA")
     if soa:
         rec.soa_record = soa[0]
-    caa = _resolve(domain, "CAA")
-    if caa:
-        rec.caa_records = ",".join(caa)
+    # CAA is inherited down the tree (RFC 8659 3): climb to the organizational domain.
+    for i in range(len(parts) - 1):
+        name = ".".join(parts[i:])
+        caa = _resolve(name, "CAA")
+        if caa:
+            rec.caa_records = ",".join(caa) + (f" (Inherited from {name})" if i else "")
+            break
+        if name == org:
+            break
 
-    return {"chain": chain, "ns": list(ns_records), "a_records": list(a_records),
-            "aaaa": list(aaaa), "txts": list(txts),
+    return {"chain": chain, "ns": list(own_ns), "zone_ns": list(ns_records), "zone": zone,
+            "a_records": list(a_records), "aaaa": list(aaaa), "txts": list(txts),
             "has_resolution": bool(a_records or aaaa or chain)}
 
 
@@ -1030,11 +1113,26 @@ def check_axfr(domain: str, ns_servers: str) -> str:
     return "No"
 
 
+_SPF_VERSION_RE = re.compile(r"^v=spf1(?:\s|$)", re.I)
+
+
+def is_spf_record(txt: str) -> bool:
+    """RFC 7208 4.5: the record is "v=spf1" followed by a space or the end of the string.
+    "v=spf1mx..." (strings split without spaces, joined as published) is not SPF."""
+    return bool(_SPF_VERSION_RE.match(txt or ""))
+
+
 def parse_spf(txts: List[str]) -> Dict[str, Any]:
-    spf = [t for t in txts if t.lower().startswith("v=spf1")]
+    spf = [t for t in txts if is_spf_record(t)]
     res = {"spf_present": bool(spf), "spf_record": spf[0] if spf else None, "spf_issues": []}
     if not spf:
-        res["spf_issues"].append("spf_missing")
+        bad = [t for t in txts if t.lower().startswith("v=spf1")]
+        if bad:
+            # Receivers ignore it, so the domain effectively has no SPF; keep the text.
+            res["spf_record"] = bad[0]
+            res["spf_issues"].append("spf_malformed_version")
+        else:
+            res["spf_issues"].append("spf_missing")
         return res
     if len(spf) > 1:
         res["spf_issues"].append("spf_multiple_records")
@@ -1064,7 +1162,7 @@ SPF_BROAD_V4, SPF_BROAD_V6 = 16, 32
 
 @lru_cache(maxsize=50000)
 def _spf_txt(name: str) -> Tuple[str, ...]:
-    return tuple(t for t in _resolve(name, "TXT") if t.lower().startswith("v=spf1"))
+    return tuple(t for t in _resolve(name, "TXT") if is_spf_record(t))
 
 
 @lru_cache(maxsize=50000)
@@ -1152,23 +1250,52 @@ def parse_dmarc(txts: List[str]) -> Dict[str, Any]:
     return res
 
 
-def detect_dangling(domain: str, chain: List[str], ns: List[str],
-                    has_resolution: bool) -> Tuple[str, str]:
+def _parent_delegation(domain: str, zone_ns: List[str]) -> Tuple[str, ...]:
+    """NS names the enclosing zone delegates `domain` to, read from that zone's own
+    referral (non-recursive query), so a delegation whose servers no longer answer is
+    still visible."""
+    for server in zone_ns[:3]:
+        try:
+            ip = RESOLVER.resolve(server, "A")[0].to_text()
+            q = dns.message.make_query(domain, "NS")
+            q.flags &= ~dns.flags.RD
+            r = dns.query.udp(q, ip, timeout=3)
+            for rrset in list(r.answer) + list(r.authority):
+                if (rrset.rdtype == dns.rdatatype.NS
+                        and rrset.name.to_text().rstrip(".").lower() == domain.lower()):
+                    return tuple(str(x.target).rstrip(".").lower() for x in rrset)
+            return ()
+        except Exception:
+            continue
+    return ()
+
+
+def detect_dangling(domain: str, chain: List[str], ns: List[str], has_resolution: bool,
+                    dns_status: str = "OK", zone_ns: Optional[List[str]] = None
+                    ) -> Tuple[str, str, str]:
+    """(status, detail, class). `ns` is the name's OWN delegation only: the NS of an
+    enclosing zone says nothing about whether this name dangles. Classes:
+    dangling-cname, dangling-delegation, lame-delegation (dangling, or suspect);
+    nxdomain, no-web-records, dns-failure, ok (not dangling)."""
     if chain:
         final = chain[-1]
         try:
             RESOLVER.resolve(final, "A")
         except dns.resolver.NXDOMAIN:
-            return "Yes", f"CNAME target NXDOMAIN: {final}"
+            return "Yes", f"CNAME target NXDOMAIN: {final}", "dangling-cname"
         except dns.resolver.NoAnswer:
-            return "Possibly", f"CNAME target has no A/AAAA: {final}"
+            if not _resolve(final, "AAAA"):
+                return "Possibly", f"CNAME target has no A/AAAA: {final}", "dangling-cname"
         except dns.exception.Timeout:
-            return "Possibly", f"CNAME target timeout: {final}"
+            return "No", f"CNAME target timeout: {final}", "dns-failure"
         except Exception:
             pass
-    if ns:
+    delegation = list(ns)
+    if not delegation and not has_resolution and dns_status in ("SERVFAIL", "TIMEOUT", "ERROR") and zone_ns:
+        delegation = list(_parent_delegation(domain, zone_ns))
+    if delegation:
         unresolved = []
-        for server in ns:
+        for server in delegation:
             # Resolve NS names through the configured RESOLVER (Cloudflare-first),
             # NOT socket.gethostbyname() — the latter leaks to the system resolver
             # (here: Tailscale MagicDNS), which can filter/answer differently and
@@ -1181,13 +1308,22 @@ def detect_dangling(domain: str, chain: List[str], ns: List[str],
                 # NoAnswer (name exists, maybe AAAA-only), timeout, SERVFAIL:
                 # don't flag as unresolvable — avoids false takeover positives.
                 pass
-        if unresolved and len(unresolved) == len(ns):
-            return "Yes", f"All NS unresolvable: {','.join(unresolved)}"
+        if unresolved and len(unresolved) == len(delegation):
+            return "Yes", f"All NS unresolvable: {','.join(unresolved)}", "dangling-delegation"
         if unresolved:
-            return "Possibly", f"Some NS unresolvable: {','.join(unresolved)}"
-    if not has_resolution and ns:
-        return "Possibly", "Has NS but no A/AAAA/CNAME resolution"
-    return "No", "N/A"
+            return "Possibly", f"Some NS unresolvable: {','.join(unresolved)}", "dangling-delegation"
+        if not has_resolution and dns_status in ("SERVFAIL", "TIMEOUT", "ERROR"):
+            # Delegated, but the delegated servers do not answer for the zone: a deleted
+            # hosted zone at a DNS provider looks like this and may be re-creatable.
+            return ("Possibly", f"Lame delegation: {','.join(delegation)} do not answer for {domain}",
+                    "lame-delegation")
+    if not has_resolution:
+        if dns_status == "NXDOMAIN":
+            return "No", "Name does not exist", "nxdomain"
+        if dns_status == "NOANSWER":
+            return "No", "Name exists without address records (mail/TXT-only or parked zone)", "no-web-records"
+        return "No", f"DNS failure ({dns_status})", "dns-failure"
+    return "No", "N/A", "ok"
 
 
 def _target_claimable_nxdomain(target: str) -> bool:
@@ -1252,41 +1388,98 @@ def detect_takeover(chain: List[str], body: str) -> Tuple[str, str]:
                         return "Yes", f"{provider} target NXDOMAIN (claimable)"
                     return "No", f"CNAME to {provider} but target resolves (live/owned)"
                 # Resolve-to-provider class: the provider serves the unclaimed
-                # fingerprint page, so a matching body signature is the signal.
-                hit = next((s for s in sigs if s in body_l), None)
-                if hit:
-                    return "Yes", f"{provider} + signature '{hit}'"
+                # fingerprint page, so a specific body signature is the signal. A
+                # generic one ("404") is only an observation.
+                strong = next((s for s in sigs if s not in WEAK_TAKEOVER_SIGNATURES and s in body_l), None)
+                if strong:
+                    return "Yes", f"{provider} + signature '{strong}'"
+                weak = next((s for s in sigs if s in WEAK_TAKEOVER_SIGNATURES and s in body_l), None)
+                if weak:
+                    return "Possibly", f"CNAME to {provider}; generic '{weak}' observed (not proof)"
                 return "Possibly", f"CNAME to {provider} (no body signature)"
     return "No", "N/A"
+
+
+def assess_takeover(host: str, chain: List[str], risk: str, detail: str) -> Dict[str, str]:
+    """Evidence behind a takeover verdict, kept apart from the verdict itself: is the
+    target gone, can its name be registered again, is the hostname protected by a
+    verification record. Claimability is never tested (that would mean claiming it)."""
+    out = {"target_missing": "N/A", "recreatable": "N/A", "binding": "N/A",
+           "confidence": "N/A", "verified": "N/A"}
+    if risk not in ("Yes", "Possibly") or not chain:
+        return out
+    provider = next((p for tgt in chain for p in TAKEOVER_PROVIDERS if p in tgt.lower()), "")
+    if "NXDOMAIN" in detail:
+        out["target_missing"] = "Yes"
+    elif "signature '" in detail and risk == "Yes":
+        out["target_missing"] = "provider-unclaimed"
+    else:
+        out["target_missing"] = "No"
+    out["recreatable"] = TAKEOVER_NAME_POLICY.get(provider, "unknown")
+    tmpl = TAKEOVER_BINDING_TXT.get(provider)
+    if tmpl:
+        out["binding"] = "Yes" if _resolve(tmpl.format(host=host), "TXT") else "No"
+    else:
+        out["binding"] = "none-known"
+    if risk == "Possibly" or out["binding"] == "Yes":
+        out["confidence"] = "Low"
+    elif out["target_missing"] == "Yes" and out["recreatable"] == "released":
+        out["confidence"] = "High"
+    else:
+        out["confidence"] = "Medium"
+    out["verified"] = "No (manual)"
+    return out
 
 
 # =====================================================================
 # TLS
 # =====================================================================
 
-def get_tls(host: str) -> Dict[str, str]:
+TLS_PORT = 443
+# Order in which defects pick the single legacy `tls_valid` label.
+CERT_DEFECT_ORDER = ("expired", "untrusted-chain", "self-signed", "invalid",
+                     "hostname-mismatch", "not-yet-valid")
+_X509_V_FLAG_NO_CHECK_TIME = 0x200000   # OpenSSL: verify the chain, ignore validity dates
+
+
+def get_tls(host: str, ip: Optional[str] = None) -> Dict[str, str]:
+    """TLS probe. Each property is judged on its own (handshake, hostname, trust, dates,
+    protocol) so one defect never hides another; `health` is derived from all of them."""
     out = {"health": "N/A", "valid": "N/A", "min": "N/A", "max": "N/A", "cipher": "N/A",
            "cert_subject": "N/A", "cert_issuer": "N/A", "cert_not_before": "N/A",
            "cert_expiry": "N/A", "cert_days_left": "N/A", "cert_sha256": "N/A",
            "cert_sans": "N/A", "cert_pem": "", "cert_key": "N/A", "cert_sig_alg": "N/A",
-           "cert_sct_count": "N/A", "cert_revocation": "N/A"}
+           "cert_sct_count": "N/A", "cert_revocation": "N/A",
+           "handshake": "N/A", "hostname": "N/A", "trust": "N/A", "dates": "N/A",
+           "protocol": "N/A", "defects": "None"}
+    # Connect to the address the audit resolved (with SNI = host), never via the system
+    # resolver, so TLS results describe the same server as the DNS columns.
+    addr = ip or host
+    try:
+        sock = socket.create_connection((addr, TLS_PORT), timeout=2.5)
+    except OSError:
+        out["handshake"] = "no-listener"
+        return out
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        with socket.create_connection((host, 443), timeout=2.5) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as ss:
-                out["health"] = "Healthy"
-                cipher = ss.cipher()
-                if cipher:
-                    out["cipher"] = cipher[0]
-                der = ss.getpeercert(binary_form=True)
-                if der:
-                    _fill_cert(der, out)
+        with sock, ctx.wrap_socket(sock, server_hostname=host) as ss:
+            out["handshake"] = "ok"
+            cipher = ss.cipher()
+            if cipher:
+                out["cipher"] = cipher[0]
+            der = ss.getpeercert(binary_form=True)
+            if der:
+                _fill_cert(der, out)
     except Exception:
+        out["handshake"], out["health"] = "failed", "Failed"
         return out
 
-    out["valid"] = _validate_cert(host)
+    out["trust"] = _verify_trust(host, addr)
+    out["dates"] = _cert_dates_state(out.get("_not_before"), out.get("_not_after"))
+    if out.get("_names") is not None:
+        out["hostname"] = "pass" if _hostname_matches(host, out["_names"]) else "fail"
 
     found = []
     for name, ver in [("TLSv1.0", ssl.TLSVersion.TLSv1),
@@ -1302,36 +1495,88 @@ def get_tls(host: str) -> Dict[str, str]:
             except ssl.SSLError:
                 pass
             ctx.minimum_version = ctx.maximum_version = ver
-            with socket.create_connection((host, 443), timeout=1.5) as sock:
+            with socket.create_connection((addr, TLS_PORT), timeout=1.5) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host):
                     found.append(name)
         except Exception:
             continue
     if found:
         out["min"], out["max"] = found[0], found[-1]
+        out["protocol"] = "pass" if found[0] in ("TLSv1.2", "TLSv1.3") else f"legacy({found[0]})"
+    _summarise_tls(out)
     return out
 
 
-def _validate_cert(host: str) -> str:
-    """Second handshake with full validation; classify why it fails if it does."""
+def _summarise_tls(out: Dict[str, str]) -> None:
+    """Derive cert_defects, the legacy single tls_valid label and overall health."""
+    defects = []
+    if out["dates"] in ("expired", "not-yet-valid"):
+        defects.append(out["dates"])
+    if out["trust"] in ("self-signed", "untrusted-chain", "invalid"):
+        defects.append(out["trust"])
+    if out["hostname"] == "fail":
+        defects.append("hostname-mismatch")
+    defects.sort(key=CERT_DEFECT_ORDER.index)
+    out["defects"] = ";".join(defects) if defects else "None"
+    if defects:
+        out["valid"] = defects[0]
+    elif out["trust"] == "pass" and out["hostname"] != "fail":
+        out["valid"] = "valid"
+    judged = [out[k] for k in ("hostname", "trust", "dates", "protocol") if out[k] != "N/A"]
+    out["health"] = "Healthy" if judged and all(v == "pass" for v in judged) else "Degraded"
+
+
+def _verify_trust(host: str, addr: Optional[str] = None) -> str:
+    """Chain trust on its own: a validating handshake that ignores the hostname and the
+    validity dates (those are judged separately), so an expired chain still reports its
+    trust result instead of only "expired"."""
     try:
         ctx = ssl.create_default_context()
-        with socket.create_connection((host, 443), timeout=2.5) as sock:
+        ctx.check_hostname = False
+        try:
+            ctx.verify_flags |= _X509_V_FLAG_NO_CHECK_TIME
+        except (ValueError, OverflowError):
+            pass
+        with socket.create_connection((addr or host, TLS_PORT), timeout=2.5) as sock:
             with ctx.wrap_socket(sock, server_hostname=host):
-                return "valid"
+                return "pass"
     except ssl.SSLCertVerificationError as e:
-        reason = (str(e) or "").lower()
-        if "expired" in reason:
-            return "expired"
-        if "hostname mismatch" in reason or "doesn't match" in reason:
-            return "hostname-mismatch"
-        if "self signed" in reason or "self-signed" in reason:
-            return "self-signed"
-        if "local issuer" in reason or "unable to get" in reason:
-            return "untrusted-chain"
-        return "invalid"
+        return _trust_reason(str(e))
     except Exception:
         return "N/A"
+
+
+def _trust_reason(message: str) -> str:
+    reason = (message or "").lower()
+    if "self signed" in reason or "self-signed" in reason:
+        return "self-signed"
+    if "local issuer" in reason or "unable to get" in reason or "unknown ca" in reason:
+        return "untrusted-chain"
+    return "invalid"
+
+
+def _cert_dates_state(not_before: Any, not_after: Any) -> str:
+    if not_before is None or not_after is None:
+        return "N/A"
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if now > not_after:
+        return "expired"
+    if now < not_before:
+        return "not-yet-valid"
+    return "pass"
+
+
+def _hostname_matches(host: str, names: List[str]) -> bool:
+    """RFC 6125 matching: exact name, or a left-most `*.` wildcard covering one label."""
+    h = host.lower().rstrip(".")
+    for n in names:
+        n = n.lower().rstrip(".")
+        if n == h:
+            return True
+        if n.startswith("*.") and "." in h and h.split(".", 1)[1] == n[2:]:
+            return True
+    return False
 
 
 def _fill_cert(der: bytes, out: Dict[str, str]) -> None:
@@ -1349,9 +1594,18 @@ def _fill_cert(der: bytes, out: Dict[str, str]) -> None:
         try:
             from datetime import datetime, timezone
             exp = expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)
+            out["_not_after"] = exp
+            out["_not_before"] = before if before.tzinfo else before.replace(tzinfo=timezone.utc)
             out["cert_days_left"] = str((exp - datetime.now(timezone.utc)).days)
         except Exception:
             pass
+        # Names for hostname matching: SANs, or the subject CN when there is no SAN.
+        try:
+            out["_names"] = list(cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName))
+        except x509.ExtensionNotFound:
+            cns = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+            out["_names"] = [str(cns[0].value)] if cns else []
         try:
             from cryptography.hazmat.primitives.serialization import Encoding
             out["cert_pem"] = cert.public_bytes(Encoding.PEM).decode("ascii")
@@ -1838,9 +2092,13 @@ def analyze_cookies(responses: List[requests.Response], rec: AuditRecord) -> Non
             c = parse_set_cookie(line)
             if c:
                 c["https"] = https
+                c["url"] = f"{resp.url}({resp.status_code})"
                 seen[c["name"]] = c          # last Set-Cookie for a name wins
     if not seen:
         return
+    rec.cookie_context = "; ".join(
+        f"{name}{'*' if SESSION_COOKIE_RE.search(name) else ''}@{c['url']}"
+        for name, c in sorted(seen.items())[:8])
     flags, no_secure, no_httponly = [], [], []
     for name, c in sorted(seen.items()):
         parts = ["Secure" if c["secure"] else "!Secure",
@@ -2010,8 +2268,15 @@ def get_web_data(domain: str, session: requests.Session, args: argparse.Namespac
                  if re.search(r"\d+\.\d+", winner.headers.get(h, ""))]
     if disclosed:
         rec.version_disclosure = " | ".join(disclosed)[:120]
-    missing = [h for h in SECURITY_HEADERS if h not in winner.headers]
-    rec.sec_headers_missing = ",".join(missing) if missing else "None"
+    rec.assessed_status = str(winner.status_code)
+    # Browser-enforced headers only mean something on an HTML page; X-Frame-Options is
+    # redundant when CSP frame-ancestors is set; X-XSS-Protection is obsolete in browsers.
+    if "html" not in rec.content_type.lower():
+        rec.sec_headers_missing = f"N/A (not HTML: {rec.content_type})"
+    else:
+        missing = [h for h in SECURITY_HEADERS if h not in winner.headers
+                   and h != "X-XSS-Protection" and not (h == "X-Frame-Options" and has_fa)]
+        rec.sec_headers_missing = ",".join(missing) if missing else "None"
     rec.page_type = "Static" if rec.size < 10000 else "Dynamic"
     rec.cdn = detect_cdn(winner.headers, rec.server, rec.asn, rec.cname)
     raw["winner"] = {"url": winner.url, "headers": dict(winner.headers),
@@ -2196,6 +2461,63 @@ def scan_ports(ip: str, ports: List[int], grab_banners: bool,
     return sorted(open_ports), banners
 
 
+PORT_NAMES = {21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http", 110: "pop3",
+              143: "imap", 443: "https", 587: "smtp", 993: "imaps", 995: "pop3s", 8000: "http",
+              8080: "http", 8443: "https"}
+PORT_NAMES.update({p: lbl for p, (_sev, lbl) in PORT_RISK.items()})
+
+# Banner -> service. Checked in order; the first match wins.
+_BANNER_RULES = [
+    (re.compile(r"^SSH-", re.I), "ssh"),
+    (re.compile(r"MiniServ", re.I), "webmin"),
+    (re.compile(r"^HTTP/\d", re.I), "http"),
+    (re.compile(r"^220[ -].*\bftp", re.I), "ftp"),
+    (re.compile(r"^220[ -].*\b(e?smtp|mail|postfix|exim|sendmail)\b", re.I), "smtp"),
+    (re.compile(r"^\+OK", re.I), "pop3"),
+    (re.compile(r"^\* OK", re.I), "imap"),
+    (re.compile(r"mysql|mariadb|caching_sha2_password", re.I), "mysql"),
+    (re.compile(r"^-(ERR|NOAUTH|DENIED)", re.I), "redis"),
+    (re.compile(r"^RFB \d", re.I), "vnc"),
+]
+# Banner services that satisfy a PORT_RISK label.
+_BANNER_SATISFIES = {"pop3": "pop3-cleartext", "imap": "imap-cleartext"}
+# PORT_RISK labels that are HTTP APIs: an HTTP banner is consistent but does not confirm them.
+_HTTP_API_LABELS = {"docker-api", "elasticsearch", "winrm"}
+
+
+def identify_service(port: int, banner: str) -> Tuple[str, str]:
+    """(service, source). source "banner" = the service said what it is; "port-guess" =
+    only the port number suggests it."""
+    b = (banner or "").strip()
+    if b:
+        if b.startswith("\xff") and port == 23:
+            return "telnet", "banner"
+        if b.startswith("220") and port == 21:
+            return "ftp", "banner"
+        for rx, svc in _BANNER_RULES:
+            if rx.search(b):
+                return svc, "banner"
+    return PORT_NAMES.get(port, "unknown"), "port-guess"
+
+
+def describe_port_services(ports: List[int], banners: Dict[int, str], tls_ports: Any = ()) -> str:
+    """tls_ports: ports where a TLS handshake already succeeded (that identifies HTTPS)."""
+    out = []
+    for p in ports:
+        svc, src = identify_service(p, banners.get(p, ""))
+        if p in tls_ports and svc in ("http", "https"):
+            svc, src = "https", "tls-handshake"
+        out.append(f"{p}:{svc}?({src})" if src == "port-guess" else f"{p}:{svc}({src})")
+    return ";".join(out) if out else "None"
+
+
+def _parse_port_services(value: str) -> Dict[int, Tuple[str, str]]:
+    out = {}
+    for m in re.finditer(r"(\d+):([\w.-]+?)\??\(([\w-]+)\)", value or ""):
+        out[int(m.group(1))] = (m.group(2), m.group(3))
+    return out
+
+
 def _grab_banner(sock: socket.socket, port: int) -> str:
     try:
         sock.settimeout(1.5)
@@ -2204,8 +2526,20 @@ def _grab_banner(sock: socket.socket, port: int) -> str:
                 sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
             except OSError:
                 return ""
-        data = sock.recv(256)
-        return data.decode("latin-1", "ignore").strip().replace("\r", " ").replace("\n", " ")[:120]
+        # Banners often arrive in more than one packet (status line, then headers):
+        # keep reading briefly so identifying lines like "Server:" are not lost.
+        data = b""
+        deadline = time.monotonic() + 1.5
+        while len(data) < 1024 and time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(1024 - len(data))
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+            sock.settimeout(max(0.05, min(0.3, deadline - time.monotonic())))
+        return data.decode("latin-1", "ignore").strip().replace("\r", " ").replace("\n", " ")[:200]
     except OSError:
         return ""
 
@@ -2415,94 +2749,158 @@ def collect_discovered(domain: str, rec: AuditRecord, chain: List[str]) -> List[
 # RISK SCORE
 # =====================================================================
 
-def score_risk(rec: AuditRecord) -> Tuple[int, List[str]]:
-    score, notes = 0, []
+def name_exists(rec: AuditRecord) -> bool:
+    """The name is in the DNS (any record type), so name-level controls apply to it."""
+    return rec.dns_status in ("OK", "NOANSWER") or rec.cname != "N/A"
 
-    def add(pts: int, why: str):
-        nonlocal score
-        score += pts
-        notes.append(f"{why} (+{pts})")
 
+def mail_controls_apply(rec: AuditRecord) -> bool:
+    """SPF/DMARC/CAA judge names that exist. A registered domain needs them even when it
+    sends no mail (that is how spoofing is blocked); a subdomain only when it has MX —
+    otherwise the organizational domain's DMARC covers it."""
+    if not name_exists(rec):
+        return False
+    return rec.is_subdomain != "Yes" or rec.mx_records not in ("None", "", "N/A")
+
+
+def score_parts(rec: AuditRecord) -> Dict[str, Any]:
+    """Risk split into exposure (reachable or claimable) and hygiene (missing hardening).
+    Only checks that ran and apply to this name score. Points from unconfirmed
+    observations are marked and lower the confidence."""
+    parts = {"exposure": 0, "hygiene": 0}
+    notes: List[str] = []
+    unconfirmed = [0]
+
+    def add(kind: str, pts: int, why: str, confirmed: bool = True):
+        parts[kind] += pts
+        if not confirmed:
+            unconfirmed[0] += pts
+        notes.append(f"{why} (+{pts}{'' if confirmed else ', unconfirmed'})")
+
+    responds = rec.http_status not in ("0", "") or rec.https_status not in ("0", "")
+
+    # --- exposure
     if rec.axfr_vuln == "Vulnerable":
-        add(40, "AXFR")
+        add("exposure", 40, "AXFR")
     if rec.dangling_status == "Yes":
-        add(45, "Dangling")
+        add("exposure", 45, f"Dangling ({rec.dangling_class})")
     elif rec.dangling_status == "Possibly":
-        add(30, "Possibly Dangling")
+        pts = 10 if rec.dangling_class == "unresponsive-cloud-ip" else 25
+        add("exposure", pts, f"Possibly dangling ({rec.dangling_class})", confirmed=False)
     if rec.takeover_risk == "Yes":
-        add(45, "Takeover")
+        if rec.takeover_confidence == "Low":
+            add("exposure", 20, "Takeover candidate (hostname verification record present)", confirmed=False)
+        else:
+            add("exposure", 45, f"Takeover ({rec.takeover_confidence} confidence, claim not verified)")
     elif rec.takeover_risk == "Possibly":
-        add(25, "Possible Takeover")
+        add("exposure", 15, "Possible takeover", confirmed=False)
     if rec.is_private_ip == "Yes":
-        add(30, "Private IP exposed")
-    if rec.has_login_form == "Yes" and rec.org_range == "No":
-        add(30, "External login page")
-    if "spf_missing" in rec.spf_issues or "spf_all_too_permissive" in rec.spf_issues:
-        add(20, "SPF weak/missing")
-    if "dmarc_missing" in rec.dmarc_issues or "dmarc_policy_none" in rec.dmarc_issues:
-        add(15, "DMARC weak/missing")
-    if rec.tls_min in ("TLSv1.0", "TLSv1.1"):
-        add(20, f"Legacy TLS ({rec.tls_min})")
-    if rec.tls_health != "Healthy" and (rec.http_status != "0" or rec.https_status != "0"):
-        add(15, "TLS unhealthy")
-    if rec.caa_records == "None":
-        add(5, "Missing CAA")
-    if rec.hsts == "No" and (rec.http_status != "0" or rec.https_status != "0"):
-        add(5, "Missing HSTS")
-    if rec.mta_sts == "absent":
-        add(3, "No MTA-STS")
-    elif rec.mta_sts in ("policy-unreachable", "policy-invalid"):
-        add(5, "MTA-STS policy broken")
+        add("exposure", 30, "Private IP exposed")
+    if rec.has_login_form == "Yes" and rec.managed_by in ("not-verified", "N/A") and rec.org_range == "No":
+        add("exposure", 30, "Login page outside org networks and managed providers")
     if re.search(r"/(admin|wp-login)[^,]*\(login\)", rec.auth_pages):
-        add(10, "Admin login path exposed")
-    if rec.spf_lookups.isdigit() and int(rec.spf_lookups) > 10:
-        add(10, f"SPF exceeds 10 lookups ({rec.spf_lookups})")
+        add("exposure", 10, "Admin login path exposed")
     if "include_unregistered(" in rec.spf_chain_issues:
-        add(25, "SPF include of unregistered domain")
-    elif "include_no_spf(" in rec.spf_chain_issues:
-        add(10, "SPF include has no record")
-    if "broad_range(" in rec.spf_chain_issues:
-        add(5, "SPF authorises an oversized range")
-    if rec.csp_issues not in ("None", "report-only"):
-        add(3, f"Weak CSP ({rec.csp_issues})")
+        add("exposure", 25, "SPF include of unregistered domain")
     if rec.cors.endswith("+credentials"):
-        add(25, f"CORS {rec.cors}")
+        add("exposure", 25, f"CORS {rec.cors}")
     elif rec.cors in ("reflects-origin", "null-origin"):
-        add(10, f"CORS {rec.cors}")
+        add("exposure", 10, f"CORS {rec.cors}")
     pts = sum(SCANNER_POINTS.get(i.partition(":")[0], 0) for i in rec.scanner_findings.split(","))
     if pts:
-        add(min(SCANNER_POINTS_CAP, pts), f"Scanner findings ({rec.scanner_max_severity} max)")
-    if rec.dkim_weak != "None":
-        add(3, f"Weak DKIM key ({rec.dkim_weak})")
-    if rec.session_cookie_no_httponly != "None":
-        add(5, "Session cookie without HttpOnly")
-    if rec.cookie_no_secure != "None":
-        add(3, "Cookie without Secure on HTTPS")
-    exposed = exposed_services(rec.ports)
+        add("exposure", min(SCANNER_POINTS_CAP, pts), f"Scanner findings ({rec.scanner_max_severity} max)")
+    exposed = exposed_services(rec.ports, rec.port_services)
     if exposed:
-        pts = min(PORT_RISK_CAP, sum(PORT_RISK_POINTS[sev] for _, sev, _ in exposed))
-        add(pts, "Exposed services: " + ",".join(f"{lbl}/{prt}" for lbl, _, prt in exposed))
-    if _weak_cert_key(rec.cert_key):
-        add(10, f"Weak cert key ({rec.cert_key})")
-    if rec.cert_sig_alg in ("md5", "sha1"):
-        add(10, f"Weak cert signature ({rec.cert_sig_alg})")
+        full = sum(PORT_RISK_POINTS[sev] for _, sev, _, ok in exposed if ok)
+        half = sum(PORT_RISK_POINTS[sev] // 2 for _, sev, _, ok in exposed if not ok)
+        total = min(PORT_RISK_CAP, full + half)
+        label = ",".join(f"{lbl}/{prt}" + ("" if ok else "?") for lbl, _, prt, ok in exposed)
+        add("exposure", total, f"Exposed services: {label}", confirmed=bool(full))
     if rec.tls_ocsp_stapling.startswith("stapled(revoked"):
-        add(30, "Certificate revoked (OCSP)")
+        add("exposure", 30, "Certificate revoked (OCSP)")
     if rec.origin_exposed == "Yes":
-        add(25, "Origin IP exposed behind CDN")
+        add("exposure", 25, "Origin IP exposed behind CDN")
     elif rec.origin_exposed == "Possibly":
-        add(10, "Possible origin IP exposure")
-    return min(100, score), notes
+        add("exposure", 10, "Possible origin IP exposure", confirmed=False)
+
+    # --- hygiene (only where the control applies and its check ran)
+    if mail_controls_apply(rec):
+        if any(k in rec.spf_issues for k in ("spf_missing", "spf_malformed_version", "spf_all_too_permissive")):
+            add("hygiene", 20, "SPF missing/invalid/permissive")
+        if "dmarc_missing" in rec.dmarc_issues or "dmarc_policy_none" in rec.dmarc_issues:
+            add("hygiene", 15, "DMARC weak/missing")
+        if rec.caa_records == "None":
+            add("hygiene", 5, "Missing CAA")
+    if rec.tls_min in ("TLSv1.0", "TLSv1.1"):
+        add("hygiene", 20, f"Legacy TLS ({rec.tls_min})")
+    if responds and rec.tls_handshake != "N/A" and rec.tls_health != "Healthy":
+        why = rec.cert_defects if rec.cert_defects != "None" else f"handshake {rec.tls_handshake}"
+        add("hygiene", 15, f"TLS unhealthy ({why})")
+    if rec.hsts == "No" and responds:
+        add("hygiene", 5, "Missing HSTS")
+    if rec.mta_sts == "absent":
+        add("hygiene", 3, "No MTA-STS")
+    elif rec.mta_sts in ("policy-unreachable", "policy-invalid"):
+        add("hygiene", 5, "MTA-STS policy broken")
+    if rec.spf_lookups.isdigit() and int(rec.spf_lookups) > 10:
+        add("hygiene", 10, f"SPF exceeds 10 lookups ({rec.spf_lookups})")
+    if "include_no_spf(" in rec.spf_chain_issues and "include_unregistered(" not in rec.spf_chain_issues:
+        add("hygiene", 10, "SPF include has no record")
+    if "broad_range(" in rec.spf_chain_issues:
+        add("hygiene", 5, "SPF authorises an oversized range")
+    if rec.csp_issues not in ("None", "report-only"):
+        add("hygiene", 3, f"Weak CSP ({rec.csp_issues})")
+    if rec.dkim_weak != "None":
+        add("hygiene", 3, f"Weak DKIM key ({rec.dkim_weak})")
+    if rec.session_cookie_no_httponly != "None":
+        add("hygiene", 5, "Session cookie without HttpOnly")
+    if rec.cookie_no_secure != "None":
+        add("hygiene", 3, "Cookie without Secure on HTTPS")
+    if _weak_cert_key(rec.cert_key):
+        add("hygiene", 10, f"Weak cert key ({rec.cert_key})")
+    if rec.cert_sig_alg in ("md5", "sha1"):
+        add("hygiene", 10, f"Weak cert signature ({rec.cert_sig_alg})")
+
+    total = parts["exposure"] + parts["hygiene"]
+    if not total:
+        conf = "N/A"
+    elif unconfirmed[0] == 0:
+        conf = "High"
+    elif unconfirmed[0] * 2 < total:
+        conf = "Medium"
+    else:
+        conf = "Low"
+    return {"exposure": parts["exposure"], "hygiene": parts["hygiene"], "confidence": conf,
+            "score": min(100, total), "notes": notes}
 
 
-def exposed_services(ports: str) -> List[Tuple[str, str, int]]:
-    """[(label, severity, port)] for risky ports in a comma-separated `ports` string."""
+def score_risk(rec: AuditRecord) -> Tuple[int, List[str]]:
+    """(risk_score, notes). Also fills risk_exposure / risk_hygiene / risk_confidence."""
+    p = score_parts(rec)
+    rec.risk_exposure, rec.risk_hygiene, rec.risk_confidence = p["exposure"], p["hygiene"], p["confidence"]
+    return p["score"], p["notes"]
+
+
+def exposed_services(ports: str, port_services: str = "") -> List[Tuple[str, str, int, bool]]:
+    """[(label, severity, port, confirmed)] for risky ports in a comma-separated `ports`
+    string. confirmed = a banner identified the service. A banner naming a different
+    service (e.g. a plain web server on 10000) removes the port from the risky list."""
+    ident = _parse_port_services(port_services)
     out = []
     for tok in (ports or "").split(","):
         tok = tok.strip()
-        if tok.isdigit() and int(tok) in PORT_RISK:
-            sev, label = PORT_RISK[int(tok)]
-            out.append((label, sev, int(tok)))
+        if not (tok.isdigit() and int(tok) in PORT_RISK):
+            continue
+        port = int(tok)
+        sev, label = PORT_RISK[port]
+        svc, src = ident.get(port, ("", "port-guess"))
+        confirmed = False
+        if src in ("banner", "tls-handshake"):
+            if svc == label or _BANNER_SATISFIES.get(svc) == label:
+                confirmed = True
+            elif not (svc == "http" and label in _HTTP_API_LABELS):
+                continue                     # the banner says it is something else
+        out.append((label, sev, port, confirmed))
     return sorted(out, key=lambda t: (-PORT_RISK_POINTS[t[1]], t[2]))
 
 
@@ -2512,12 +2910,229 @@ def _weak_cert_key(cert_key: str) -> bool:
 
 
 # =====================================================================
+# HOSTING, ROOTS, REACHABILITY, CHECK STATES, PROVENANCE
+# =====================================================================
+
+# Provider markers matched (case-insensitive substring) against the ASN name (--geo),
+# reverse DNS and CNAME chain. A match makes the host "cloud"-hosted by that provider.
+CLOUD_PROVIDER_MARKERS = {
+    "aws": ("amazon", "amazonaws.com"),
+    "azure": ("microsoft", "azure", "windows.net", "cloudapp.net", "msedge.net"),
+    "gcp": ("google", "googleusercontent.com", "1e100.net"),
+    "oracle": ("oracle", "oraclecloud"),
+    "ibm": ("softlayer", "ibm cloud"),
+    "alibaba": ("alibaba", "aliyun"),
+    "digitalocean": ("digitalocean",),
+    "linode": ("linode",),
+    "hetzner": ("hetzner",),
+    "ovh": ("ovh",),
+}
+CLOUD_PROVIDER_MARKERS.update({k: tuple(v) for k, v in _tune("cloud_provider_markers", {}).items()})
+# Name fragments that mark a private endpoint (resolves publicly, served privately).
+PRIVATE_ENDPOINT_MARKERS = tuple(_tune("private_endpoint_markers", [".privatelink."]))
+
+
+def classify_hosting(rec: AuditRecord, org_networks_hit: bool,
+                     managed_providers: List[str]) -> Tuple[str, str, str]:
+    """(network_owner, hosting_class, managed_by). Network location is NOT management:
+    a host outside the org's address space may still be run by the org on a provider it
+    uses (brand config `managed_providers`). Nothing here claims a host is unmanaged."""
+    if rec.ip == "N/A":
+        return "N/A", "N/A", "N/A"
+    evidence = " ".join(x for x in (rec.asn, rec.ptr, rec.cname) if x not in ("N/A", "Unknown")).lower()
+    provider = next((name for name, marks in CLOUD_PROVIDER_MARKERS.items()
+                     if any(m in evidence for m in marks)), "")
+    if rec.asn not in ("N/A", "Unknown", ""):
+        owner = rec.asn
+    elif provider:
+        owner = provider
+    elif rec.ptr not in ("N/A", ""):
+        owner = registrable_domain(rec.ptr) or "unknown"
+    else:
+        owner = "unknown"
+    if rec.is_private_ip == "Yes":
+        hclass = "private"
+    elif org_networks_hit:
+        hclass = "org"
+    elif rec.cdn not in ("No", "", "N/A"):
+        hclass = "cdn"
+        provider = provider or rec.cdn.split()[0].lower()
+    elif provider:
+        hclass = "cloud"
+    elif rec.ptr not in ("N/A", ""):
+        hclass = "third-party"
+    else:
+        hclass = "unknown"
+    managed = {m.lower() for m in managed_providers}
+    if org_networks_hit:
+        managed_by = "org-network"
+    elif provider and provider in managed:
+        managed_by = f"org-provider({provider})"
+    elif owner.lower() in managed:
+        managed_by = f"org-provider({owner.lower()})"
+    else:
+        managed_by = "not-verified"
+    return owner, hclass, managed_by
+
+
+def host_root(host: str, roots: Any = ()) -> str:
+    """The portfolio root a host sits under: the longest matching configured root
+    (--roots / config `roots`), else its registrable domain (Public Suffix List). A bare
+    TLD (a brand TLD entered on its own) is its own root."""
+    h = (host or "").lower().rstrip(".")
+    best = ""
+    for r in roots or ():
+        if (h == r or h.endswith("." + r)) and len(r) > len(best):
+            best = r
+    return best or registrable_domain(h) or h
+
+
+def private_endpoint(rec: AuditRecord) -> str:
+    if rec.is_private_ip == "Yes":
+        return "Yes(private-ip)"
+    names = f"{rec.domain} {rec.cname}".lower()
+    hit = next((m for m in PRIVATE_ENDPOINT_MARKERS if m.lower() in names), None)
+    return f"Yes(name:{hit.strip('.')})" if hit else "No"
+
+
+def describe_reachability(rec: AuditRecord, port_scanned: bool) -> str:
+    """How far a client gets: DNS -> TCP -> TLS -> HTTP, each observed separately."""
+    dns_state = {"OK": "ok"}.get(rec.dns_status, rec.dns_status.lower() if rec.dns_status != "N/A" else "n/a")
+    responds = rec.http_status not in ("0", "") or rec.https_status not in ("0", "")
+    if rec.ip == "N/A":
+        tcp = "n/a"
+    elif responds or rec.tls_handshake in ("ok", "failed") or rec.ports:
+        tcp = "ok"
+    elif port_scanned:
+        tcp = "closed"
+    else:
+        tcp = "unknown"
+    tls = {"ok": "ok", "failed": "failed", "no-listener": "none"}.get(rec.tls_handshake, "n/a")
+    http = rec.https_status if rec.https_status not in ("0", "") else rec.http_status
+    http = http if http not in ("0", "") else "none"
+    return f"dns:{dns_state};tcp:{tcp};tls:{tls};http:{http}"
+
+
+def endpoint_ids(rec: AuditRecord) -> str:
+    if rec.ip == "N/A":
+        return "None"
+    ports = [p for p in (rec.ports or "").split(",") if p.strip()]
+    if not ports:
+        if rec.tls_handshake in ("ok", "failed"):
+            ports.append("443")
+        if rec.http_status not in ("0", ""):
+            ports.append("80")
+    return ",".join(f"{rec.ip}:{p}" for p in sorted(set(ports), key=int)) or "None"
+
+
+def site_id(rec: AuditRecord) -> str:
+    if rec.body_sha256 in ("N/A", "") or rec.final_url in ("N/A", ""):
+        return "N/A"
+    host = urlparse(rec.final_url).netloc.lower()
+    return hashlib.sha256(f"{host}|{rec.body_sha256}".encode()).hexdigest()[:16]
+
+
+CHECK_STATES = ("passed", "failed", "not_applicable", "not_run", "timeout", "error")
+
+
+def describe_checks(rec: AuditRecord, args: argparse.Namespace, port_list: List[int]) -> str:
+    """One state per check, so "nothing found" and "never looked" are distinguishable."""
+    st: Dict[str, str] = {}
+    responds = rec.http_status not in ("0", "") or rec.https_status not in ("0", "")
+    st["dns"] = {"OK": "passed", "NXDOMAIN": "passed", "NOANSWER": "passed",
+                 "TIMEOUT": "timeout"}.get(rec.dns_status, "error")
+    if args.no_rdap:
+        st["rdap"] = "not_run"
+    else:
+        st["rdap"] = "passed" if rec.rdap_registrar != "N/A" else "error"
+    if args.no_tls:
+        st["tls"] = "not_run"
+    elif rec.tls_handshake in ("N/A", "no-listener"):
+        st["tls"] = "not_applicable"
+    else:
+        st["tls"] = "passed" if rec.tls_health == "Healthy" else "failed"
+    has_addr = rec.ip != "N/A" or rec.ipv6 != "N/A"
+    st["http"] = "not_applicable" if not has_addr else ("passed" if responds else "failed")
+    if mail_controls_apply(rec):
+        st["spf"] = "failed" if any(k in rec.spf_issues for k in
+                                    ("spf_missing", "spf_malformed_version", "spf_all_too_permissive")) else "passed"
+        st["dmarc"] = "failed" if ("dmarc_missing" in rec.dmarc_issues
+                                   or "dmarc_policy_none" in rec.dmarc_issues) else "passed"
+        st["caa"] = "failed" if rec.caa_records == "None" else "passed"
+    else:
+        st["spf"] = st["dmarc"] = st["caa"] = "not_applicable"
+    has_mx = bool(mx_hosts(rec.mx_records))
+    if args.no_email_hardening:
+        st["mta_sts"] = "not_run"
+    elif not has_mx:
+        st["mta_sts"] = "not_applicable"
+    else:
+        st["mta_sts"] = "passed" if rec.mta_sts == "enforce" else "failed"
+    st["dkim"] = ("not_run" if not args.dkim else "not_applicable" if not has_mx
+                  else "failed" if rec.dkim_weak != "None" else "passed")
+    st["axfr"] = ("not_run" if args.no_axfr else "not_applicable" if rec.soa_record == "N/A"
+                  else "failed" if rec.axfr_vuln == "Vulnerable" else "passed")
+    if not port_list:
+        st["ports"] = "not_run"
+    elif rec.ip == "N/A" or (rec.cdn not in ("No", "") and not args.ports_behind_cdn):
+        st["ports"] = "not_applicable"
+    else:
+        st["ports"] = "failed" if exposed_services(rec.ports, rec.port_services) else "passed"
+    st["banners"] = "not_run" if (args.no_banners or not port_list) else (
+        "passed" if rec.ports else "not_applicable")
+    st["takeover"] = ("not_applicable" if rec.cname == "N/A"
+                      else "failed" if rec.takeover_risk in ("Yes", "Possibly") else "passed")
+    st["dangling"] = ("failed" if rec.dangling_status in ("Yes", "Possibly")
+                      else "timeout" if rec.dangling_class == "dns-failure" and rec.dns_status == "TIMEOUT"
+                      else "passed")
+    st["cors"] = "not_run" if not args.cors else ("not_applicable" if not responds else
+                                                  "failed" if rec.cors not in ("none", "restricted", "N/A") else "passed")
+    st["auth_paths"] = "not_run" if not args.auth_paths else ("not_applicable" if not responds else "passed")
+    st["origin"] = "not_run" if not args.origin else ("not_applicable" if rec.cdn == "No" else
+                                                      "failed" if rec.origin_exposed != "No" else "passed")
+    st["harvest"] = "not_run" if not args.harvest else ("not_applicable" if not responds else "passed")
+    st["scanner"] = "not_run" if INGEST is None else ("failed" if rec.scanner_findings not in ("None", "not_run")
+                                                      else "passed")
+    return ";".join(f"{k}={v}" for k, v in st.items())
+
+
+def parse_checks(value: str) -> Dict[str, str]:
+    return dict(p.split("=", 1) for p in (value or "").split(";") if "=" in p)
+
+
+def _rules_version() -> str:
+    material = json.dumps({"takeover": TAKEOVER_PROVIDERS, "nx": NXDOMAIN_ONLY_PROVIDERS,
+                           "weak": sorted(WEAK_TAKEOVER_SIGNATURES), "names": TAKEOVER_NAME_POLICY,
+                           "binding": TAKEOVER_BINDING_TXT, "ports": PORT_RISK,
+                           "platforms": {k: v for k, v in PLATFORMS.items() if k != "_source"}},
+                          sort_keys=True, default=str)
+    return hashlib.sha256(material.encode()).hexdigest()[:12]
+
+
+RULES_VERSION = ""          # set by refresh_rules_version() once the rule tables are final
+
+
+def refresh_rules_version() -> str:
+    global RULES_VERSION
+    RULES_VERSION = _rules_version()
+    return RULES_VERSION
+
+
+def _utc_now() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# =====================================================================
 # PER-DOMAIN PIPELINE
 # =====================================================================
 
 def process_domain(domain: str, session: requests.Session, args: argparse.Namespace,
                    org_networks: List[Any], port_list: List[int]) -> AuditRecord:
     rec = AuditRecord(domain=domain)
+    rec.clipeus_version, rec.rules_version = __version__, RULES_VERSION
+    rec.root_domain = host_root(domain, getattr(args, "roots", ()))
+    rec.is_subdomain = "Yes" if domain != rec.root_domain else "No"
     raw: Dict[str, Any] = {"domain": domain}
     rec._raw = raw  # type: ignore[attr-defined]  (excluded from CSV/flat output)
     if STOP.is_set():
@@ -2528,14 +3143,16 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
     try:
         dns_bits = get_dns_audit(domain, rec)
         raw["dns"] = {"a": dns_bits["a_records"], "aaaa": dns_bits["aaaa"],
-                      "ns": dns_bits["ns"], "cname": dns_bits["chain"],
-                      "txt": dns_bits["txts"]}
+                      "ns": dns_bits["ns"], "zone": dns_bits["zone"], "zone_ns": dns_bits["zone_ns"],
+                      "cname": dns_bits["chain"], "txt": dns_bits["txts"]}
 
+        org_hit = False
         if rec.ip != "N/A":
             try:
                 ip_obj = ipaddress.ip_address(rec.ip)
                 rec.is_private_ip = "Yes" if ip_obj.is_private else "No"
-                rec.org_range = "Yes" if any(ip_obj in n for n in org_networks) else "No"
+                org_hit = any(ip_obj in n for n in org_networks)
+                rec.org_range = "Yes" if org_hit else "No"
             except ValueError:
                 pass
             rec.ptr = reverse_dns(rec.ip)
@@ -2565,9 +3182,12 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
                     rec.rdap_status = w_status
                 raw["whois"] = {"source": w_src, **w_raw}
 
-        if not args.no_tls:
-            tls = get_tls(domain)
+        has_addr = rec.ip != "N/A" or rec.ipv6 != "N/A"
+        if not args.no_tls and has_addr:
+            tls = get_tls(domain, next((a for a in (rec.ip, rec.ipv6) if a != "N/A"), None))
             rec.tls_health, rec.tls_valid = tls["health"], tls["valid"]
+            rec.tls_handshake, rec.tls_hostname, rec.tls_trust = tls["handshake"], tls["hostname"], tls["trust"]
+            rec.tls_dates, rec.tls_protocol, rec.cert_defects = tls["dates"], tls["protocol"], tls["defects"]
             rec.tls_min, rec.tls_max, rec.tls_cipher = tls["min"], tls["max"], tls["cipher"]
             rec.cert_subject, rec.cert_issuer = tls["cert_subject"], tls["cert_issuer"]
             rec.cert_not_before, rec.cert_expiry = tls["cert_not_before"], tls["cert_expiry"]
@@ -2577,12 +3197,12 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
             rec.cert_sct_count, rec.cert_revocation = tls["cert_sct_count"], tls["cert_revocation"]
             if tls["cert_pem"]:
                 raw["cert_pem"] = tls["cert_pem"]
-            if args.jarm and rec.tls_health == "Healthy":
+            if args.jarm and rec.tls_handshake == "ok":
                 rec.jarm = jarm_fingerprint(domain)
-            if args.ocsp and rec.tls_health == "Healthy":
+            if args.ocsp and rec.tls_handshake == "ok":
                 rec.tls_ocsp_stapling = check_ocsp_stapling(domain)
 
-        if not args.no_axfr:
+        if not args.no_axfr and rec.soa_record != "N/A":      # only a zone apex can be transferred
             rec.axfr_vuln = check_axfr(domain, rec.ns_servers)
 
         if rec.spf not in ("None", "", "N/A") and not args.no_spf_chain:
@@ -2591,11 +3211,18 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
             if chain["issues"]:
                 rec.spf_chain_issues = ",".join(chain["issues"])
 
-        body = get_web_data(domain, session, args, rec, raw)
+        # HTTP goes through the system resolver; only fetch names the audit's own
+        # resolvers can resolve, or the web columns would describe a different answer.
+        body = get_web_data(domain, session, args, rec, raw) if dns_bits["has_resolution"] else ""
 
-        rec.dangling_status, rec.dangling_detail = detect_dangling(
-            domain, dns_bits["chain"], dns_bits["ns"], dns_bits["has_resolution"])
+        rec.dangling_status, rec.dangling_detail, rec.dangling_class = detect_dangling(
+            domain, dns_bits["chain"], dns_bits["ns"], dns_bits["has_resolution"],
+            rec.dns_status, dns_bits["zone_ns"])
         rec.takeover_risk, rec.takeover_detail = detect_takeover(dns_bits["chain"], body)
+        tk = assess_takeover(domain, dns_bits["chain"], rec.takeover_risk, rec.takeover_detail)
+        (rec.takeover_target_missing, rec.takeover_recreatable, rec.takeover_binding_protected,
+         rec.takeover_confidence, rec.takeover_claim_verified) = (
+            tk["target_missing"], tk["recreatable"], tk["binding"], tk["confidence"], tk["verified"])
 
         if args.cors and (rec.https_status != "0" or rec.http_status != "0") and rec.is_forwarded != "Yes":
             scheme = "https" if rec.https_status != "0" else "http"
@@ -2617,11 +3244,14 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
                 rec.origin_exposed = "Yes" if any(o["cert_match"] for o in origins) else "Possibly"
 
         # CDN edges make host port scans meaningless; skip unless forced.
-        if port_list and (rec.cdn == "No" or args.ports_behind_cdn):
-            ports, banners = scan_ports(rec.ip, port_list, args.banners)
+        port_scanned = bool(port_list) and rec.ip != "N/A" and (rec.cdn == "No" or args.ports_behind_cdn)
+        if port_scanned:
+            ports, banners = scan_ports(rec.ip, port_list, not args.no_banners)
             rec.ports = ",".join(map(str, ports))
-            if banners:
+            if banners and any(banners.values()):
                 rec.port_banners = " | ".join(f"{p}:{b}" for p, b in sorted(banners.items()) if b)
+            rec.port_services = describe_port_services(
+                ports, banners, {TLS_PORT} if rec.tls_handshake == "ok" else ())
             raw["ports"] = {"open": ports, "banners": banners}
 
         discovered = collect_discovered(domain, rec, dns_bits["chain"])
@@ -2631,6 +3261,20 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
         if INGEST:
             apply_ingest(rec, INGEST)
 
+        rec.network_owner, rec.hosting_class, rec.managed_by = classify_hosting(
+            rec, org_hit, getattr(args, "managed_providers", []))
+        rec.private_endpoint = private_endpoint(rec)
+        rec.reachability = describe_reachability(rec, port_scanned)
+        rec.endpoint_ids, rec.site_id = endpoint_ids(rec), site_id(rec)
+        # An address at a cloud provider that answers nothing may be a released IP.
+        if (rec.dangling_class == "ok" and rec.hosting_class == "cloud" and not rec.ports
+                and rec.http_status in ("0", "") and rec.https_status in ("0", "")
+                and rec.tls_handshake in ("N/A", "no-listener")):
+            rec.dangling_status, rec.dangling_class = "Possibly", "unresponsive-cloud-ip"
+            rec.dangling_detail = f"{rec.ip} ({rec.network_owner}) answers on no probed port"
+        if INGEST is None:
+            rec.scanner_findings = "not_run"
+
         rec.dirty_forwarding = "Yes" if (rec.is_forwarded == "Yes"
                                          and rec.tls_health != "Healthy") else "No"
         rec.platform_risk = assess_platforms(
@@ -2639,8 +3283,11 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
         classify_domain(rec, args.approved_mx, args.approved_redirect)
         rec.risk_score, notes = score_risk(rec)
         rec.score_notes = "; ".join(notes)
+        rec.checks = describe_checks(rec, args, port_list)
     except Exception as exc:
         rec.error = f"{type(exc).__name__}: {exc}"
+        rec.checks = "pipeline=error"
+    rec.scanned_at = _utc_now()
     return rec
 
 
@@ -2715,16 +3362,19 @@ def classify_domain(rec: AuditRecord, approved_mx: List[str],
         issues.append(f"independent-MX({rec.mx_records.split(',')[0].split()[-1] if rec.mx_records not in ('None','N/A','') else '?'})")
     if rec.service_independent == "Yes":
         issues.append("independent-service-not-redirecting")
-    if "spf_missing" in rec.spf_issues:
-        issues.append("spf-missing")
-    elif rec.spf_issues not in ("None", ""):
-        issues.append(f"spf({rec.spf_issues})")
-    if "dmarc_missing" in rec.dmarc_issues:
-        issues.append("dmarc-missing")
-    elif rec.dmarc_issues not in ("None", ""):
-        issues.append(f"dmarc({rec.dmarc_issues})")
-    if rec.tls_valid in ("expired", "hostname-mismatch", "self-signed", "untrusted-chain"):
-        issues.append(f"cert-{rec.tls_valid}")
+    if mail_controls_apply(rec):
+        if "spf_missing" in rec.spf_issues:
+            issues.append("spf-missing")
+        elif rec.spf_issues not in ("None", ""):
+            issues.append(f"spf({rec.spf_issues})")
+        if "dmarc_missing" in rec.dmarc_issues:
+            issues.append("dmarc-missing")
+        elif rec.dmarc_issues not in ("None", ""):
+            issues.append(f"dmarc({rec.dmarc_issues})")
+    if rec.cert_defects not in ("None", "", "N/A"):
+        issues += [f"cert-{d}" for d in rec.cert_defects.split(";")]
+    elif rec.tls_valid in ("expired", "hostname-mismatch", "self-signed", "untrusted-chain"):
+        issues.append(f"cert-{rec.tls_valid}")      # records written before cert_defects existed
     if rec.tls_min in ("TLSv1.0", "TLSv1.1"):
         issues.append(f"legacy-tls({rec.tls_min})")
     if rec.cert_days_left not in ("N/A", "") and rec.cert_days_left.lstrip("-").isdigit() and int(rec.cert_days_left) < 21:
@@ -2797,8 +3447,8 @@ def classify_domain(rec: AuditRecord, approved_mx: List[str],
         issues.append("possible-origin-exposure")
     if rec.axfr_vuln == "Vulnerable":
         issues.append("axfr-open")
-    for label, _sev, port in exposed_services(rec.ports):
-        issues.append(f"exposed-{label}({port})")
+    for label, _sev, port, confirmed in exposed_services(rec.ports, rec.port_services):
+        issues.append(f"exposed-{label}({port})" if confirmed else f"exposed-{label}-unconfirmed({port})")
     rec.config_issues = "; ".join(issues) if issues else "None"
 
 
@@ -3053,8 +3703,9 @@ def diff_results(old: List[dict], new: List[dict]) -> Dict[str, Any]:
     """Compare two result sets keyed by domain."""
     o = {r["domain"]: r for r in old if r.get("domain")}
     n = {r["domain"]: r for r in new if r.get("domain")}
-    out: Dict[str, Any] = {"old_count": len(o), "new_count": len(n),
+    out: Dict[str, Any] = {"unit": "hostnames", "old_count": len(o), "new_count": len(n),
                            "added": [], "removed": [], "new_issues": [], "resolved_issues": [],
+                           "transient": [], "persistent_issues": 0,
                            "changes": [], "risk_up": [], "risk_down": []}
     for d in sorted(n.keys() - o.keys()):
         out["added"].append({"domain": d, "risk": _risk(n[d]), "issues": sorted(_issue_set(n[d]))})
@@ -3063,10 +3714,19 @@ def diff_results(old: List[dict], new: List[dict]) -> Dict[str, Any]:
     for d in sorted(n.keys() & o.keys()):
         a, b = o[d], n[d]
         gained, lost = _issue_set(b) - _issue_set(a), _issue_set(a) - _issue_set(b)
+        out["persistent_issues"] += len(_issue_set(a) & _issue_set(b))
         if gained:
             out["new_issues"].append({"domain": d, "issues": sorted(gained)})
         if lost:
-            out["resolved_issues"].append({"domain": d, "issues": sorted(lost)})
+            # An issue that vanished while this run could not look (DNS/TLS/HTTP timed out
+            # or errored) is not resolved: report it as transient.
+            states = parse_checks(str(b.get("checks") or ""))
+            blind = sorted(k for k in ("dns", "tls", "http") if states.get(k) in ("timeout", "error"))
+            if blind or b.get("error"):
+                out["transient"].append({"domain": d, "issues": sorted(lost),
+                                         "why": ",".join(blind) or "error"})
+            else:
+                out["resolved_issues"].append({"domain": d, "issues": sorted(lost)})
         for f in DIFF_TRACKED_FIELDS:
             va, vb = str(a.get(f) if a.get(f) is not None else ""), str(b.get(f) if b.get(f) is not None else "")
             if va != vb:
@@ -3092,10 +3752,12 @@ def render_diff_text(diff: Dict[str, Any], old_label: str, new_label: str, limit
 
     n_new = sum(len(x["issues"]) for x in diff["new_issues"]) + sum(len(x["issues"]) for x in diff["added"])
     n_res = sum(len(x["issues"]) for x in diff["resolved_issues"])
+    n_tr = sum(len(x["issues"]) for x in diff.get("transient", []))
     lines = [f"# Scan diff: {old_label} -> {new_label}", "",
-             f"Domains: {diff['old_count']} -> {diff['new_count']} "
+             f"Hostnames: {diff['old_count']} -> {diff['new_count']} "
              f"(+{len(diff['added'])} new, -{len(diff['removed'])} not in this run)",
-             f"Issues: {n_new} new, {n_res} resolved | risk up >= {DIFF_RISK_DELTA}: "
+             f"Issues (per hostname): {n_new} new, {n_res} resolved, {n_tr} not re-checked (transient), "
+             f"{diff.get('persistent_issues', 0)} persistent | risk up >= {DIFF_RISK_DELTA}: "
              f"{len(diff['risk_up'])} | risk down: {len(diff['risk_down'])}", ""]
     lines += section("New domains", [f"{x['domain']}  risk={x['risk']}  " + ("; ".join(x["issues"]) or "no issues")
                                      for x in diff["added"]])
@@ -3103,6 +3765,8 @@ def render_diff_text(diff: Dict[str, Any], old_label: str, new_label: str, limit
                      [f"{x['domain']}  (was risk={x['risk']})" for x in diff["removed"]])
     lines += section("New issues", [f"{x['domain']}: " + "; ".join(x["issues"]) for x in diff["new_issues"]])
     lines += section("Resolved issues", [f"{x['domain']}: " + "; ".join(x["issues"]) for x in diff["resolved_issues"]])
+    lines += section("Not re-checked this run (transient, not resolved)",
+                     [f"{x['domain']} [{x['why']}]: " + "; ".join(x["issues"]) for x in diff.get("transient", [])])
     lines += section("Changed fields", [f"{x['domain']}  {x['field']}: {x['old'] or '-'} -> {x['new'] or '-'}"
                                         for x in diff["changes"]])
     lines += section("Risk increased", [f"{x['domain']}  {x['old']} -> {x['new']} (+{x['delta']})"
@@ -3206,9 +3870,9 @@ def render_html_report(records: List[dict], title: str, source: str,
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
 <title>{esc(title)}</title><style>{_REPORT_CSS}</style></head><body><main>
-<h1>{esc(title)}</h1><p class="sub">Source: {esc(source)} &middot; {total} domains</p>
+<h1>{esc(title)}</h1><p class="sub">Source: {esc(source)} &middot; {total} hostnames (one row per hostname)</p>
 <div class="cards">
-<div class="card"><b>{total}</b><span>domains</span></div>
+<div class="card"><b>{total}</b><span>hostnames</span></div>
 <div class="card"><b>{with_issues}</b><span>with config issues</span></div>
 <div class="card"><b>{high}</b><span>risk 50 or higher</span></div>
 <div class="card"><b>{live}</b><span>live / responding</span></div>
@@ -3235,11 +3899,13 @@ def merge_results(src: str, dst: str, idx: Dict[str, Any], args: argparse.Namesp
         if not d.get("domain"):
             continue
         rec = AuditRecord(**{k: d[k] for k in FIELDNAMES if k in d})
+        if rec.scanner_findings == "not_run":
+            rec.scanner_findings = "None"          # the scanner has now run for this record
         apply_ingest(rec, idx)
         classify_domain(rec, args.approved_mx, args.approved_redirect)
         rec.risk_score, notes = score_risk(rec)
         rec.score_notes = "; ".join(notes)
-        matched += rec.scanner_findings != "None"
+        matched += rec.scanner_findings not in ("None", "not_run")
         writer.write(rec)
     writer.close()
     log(f"[*] merged scanner data into {matched}/{len(recs)} records -> {dst}")
@@ -3281,6 +3947,77 @@ def post_process(results_path: str, baseline: Optional[str], report_html: Option
 
 
 
+class RunStats:
+    """Counts with explicit units, so a total is never ambiguous: hostnames, distinct IPs,
+    distinct certificates, distinct sites (same content behind many names)."""
+    def __init__(self) -> None:
+        self.hostnames = 0
+        self.ips: set = set()
+        self.certs: set = set()
+        self.sites: set = set()
+        self.errors = 0
+
+    def add(self, rec: AuditRecord) -> None:
+        self.hostnames += 1
+        self.errors += bool(rec.error)
+        if rec.ip != "N/A":
+            self.ips.add(rec.ip)
+        if rec.cert_sha256 not in ("N/A", ""):
+            self.certs.add(rec.cert_sha256)
+        if rec.site_id not in ("N/A", ""):
+            self.sites.add(rec.site_id)
+
+    def as_dict(self) -> Dict[str, int]:
+        return {"hostnames": self.hostnames, "distinct_ips": len(self.ips),
+                "distinct_certificates": len(self.certs), "distinct_sites": len(self.sites),
+                "records_with_errors": self.errors}
+
+
+def _sha256_file(path: Optional[str]) -> str:
+    if not path or not os.path.isfile(path):
+        return "N/A"
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 16), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def write_manifest(output: str, args: argparse.Namespace, config_path: Optional[str],
+                   started: str, finished: str, domains: List[str], stats: "RunStats") -> str:
+    """<output>.manifest.json: what produced this file, so a report built from it can be
+    reproduced. Holds hashes and counts, never the configuration's content."""
+    tuning_src = _TUNING.get("_source")
+    flags = {k: v for k, v in sorted(vars(args).items())
+             if k not in ("roots", "managed_providers", "approved_mx", "approved_redirect")
+             and isinstance(v, (str, int, float, bool, list, type(None)))}
+    # Paths are reduced to file names so the manifest can travel without local layout.
+    flags = {k: (os.path.basename(v) if isinstance(v, str) and os.sep in v else v) for k, v in flags.items()}
+    manifest = {
+        "clipeus_version": __version__,
+        "rules_version": RULES_VERSION,
+        "started": started, "finished": finished,
+        "output": os.path.basename(output),
+        "input": {"path": os.path.basename(args.input) if args.input != "-" else "-",
+                  "sha256": _sha256_file(args.input if args.input != "-" else None),
+                  "hosts": len(domains)},
+        "config": {"sha256": _sha256_file(config_path), "roots": len(args.roots),
+                   "managed_providers": len(args.managed_providers),
+                   "approved_mx": len(args.approved_mx), "approved_redirect": len(args.approved_redirect)},
+        "tuning_sha256": _sha256_file(tuning_src) if isinstance(tuning_src, str) else "N/A",
+        "platforms_sha256": _sha256_file(PLATFORMS.get("_source")) if PLATFORMS.get("_source") else "N/A",
+        "resolvers": list(RESOLVER.nameservers),
+        "flags": flags,
+        "counts": stats.as_dict(),
+        "subdomain_rule": "is_subdomain = host differs from root_domain; root_domain = longest "
+                          "configured root that is a suffix of the host, else its registrable domain",
+    }
+    path = output + ".manifest.json"
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+    return path
+
+
 class EmitSink:
     CATEGORIES = {"urls", "live", "open-ports", "takeover", "sans", "new-domains",
                   "origins", "exposed", "auth-urls"}
@@ -3314,7 +4051,7 @@ class EmitSink:
         if "origins" in self.cats and rec.origin_candidates != "None":
             out += re.findall(r"(?:^|,)([0-9A-Fa-f:.]+)\(score=", rec.origin_candidates)
         if "exposed" in self.cats:
-            out += [f"{rec.domain}:{port}" for _lbl, _sev, port in exposed_services(rec.ports)]
+            out += [f"{rec.domain}:{port}" for _lbl, _sev, port, _ok in exposed_services(rec.ports, rec.port_services)]
         if "auth-urls" in self.cats and rec.auth_pages not in ("N/A", "none-found", ""):
             scheme = "https" if rec.https_status != "0" else "http"
             out += [f"{scheme}://{rec.domain}{m.group(1)}"
@@ -3329,6 +4066,70 @@ class EmitSink:
 # =====================================================================
 # SELFTEST
 # =====================================================================
+
+def _tls_selftest(check) -> None:
+    """Local TLS server (127.0.0.1 only) with generated certificates: verifies that
+    defects are judged independently. No external traffic."""
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    def serve(days_from: int, days_to: int, san: str):
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, san)])
+        now = datetime.now(timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                .not_valid_before(now + timedelta(days=days_from)).not_valid_after(now + timedelta(days=days_to))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName(san)]), False)
+                .sign(key, hashes.SHA256()))
+        td = tempfile.mkdtemp()
+        cf, kf = os.path.join(td, "c.pem"), os.path.join(td, "k.pem")
+        with open(cf, "wb") as fh:
+            fh.write(cert.public_bytes(serialization.Encoding.PEM))
+        with open(kf, "wb") as fh:
+            fh.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption()))
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(cf, kf)
+        lsock = socket.socket()
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen(16)
+        lsock.settimeout(0.5)
+        stop = threading.Event()
+
+        def loop():
+            while not stop.is_set():
+                try:
+                    conn, _ = lsock.accept()
+                except OSError:
+                    continue
+                try:
+                    with sctx.wrap_socket(conn, server_side=True):
+                        pass
+                except Exception:
+                    pass
+        threading.Thread(target=loop, daemon=True).start()
+        return lsock, stop, td
+
+    saved = TLS_PORT
+    for days, san, want in (((-30, -1), "other.example", "expired;self-signed;hostname-mismatch"),
+                            ((-1, 30), "localhost", "self-signed")):
+        lsock, stop, td = serve(days[0], days[1], san)
+        try:
+            globals()["TLS_PORT"] = lsock.getsockname()[1]
+            out = get_tls("localhost")
+            check(out["handshake"] == "ok" and out["defects"] == want and out["health"] == "Degraded",
+                  f"TLS local server: defects={out['defects']} (want {want})")
+        finally:
+            globals()["TLS_PORT"] = saved
+            stop.set()
+            lsock.close()
+            shutil.rmtree(td, ignore_errors=True)
+
 
 def selftest() -> int:
     import tempfile
@@ -3365,6 +4166,12 @@ def selftest() -> int:
     check(normalize_host("ドメイン.com") == "xn--eckwd4c7c.com", "normalize clean IDN untouched")
     spf = parse_spf(["v=spf1 include:a include:b +all"])
     check("spf_all_too_permissive" in spf["spf_issues"], "SPF +all flagged")
+    # S11: TXT strings split without spaces join into "v=spf1mx..." — not an SPF record.
+    spf = parse_spf(["v=spf1mxinclude:_spf.example.net~all"])
+    check(not spf["spf_present"] and spf["spf_issues"] == ["spf_malformed_version"]
+          and spf["spf_record"].startswith("v=spf1mx"), "SPF without a space after v=spf1 is malformed")
+    check(is_spf_record("v=spf1") and is_spf_record("V=SPF1 -all") and not is_spf_record("v=spf10 -all"),
+          "SPF version tag must end at a space or end of record")
     dm = parse_dmarc(["v=DMARC1; p=none"])
     check("dmarc_policy_none" in dm["dmarc_issues"], "DMARC p=none flagged")
     check(detect_cdn({"cf-ray": "x"}, "cloudflare", "AS13335", "")[:5] == "Cloud", "CDN detect")
@@ -3440,12 +4247,40 @@ def selftest() -> int:
     except Exception as exc:  # backend refuses to mint a weak test cert
         print(f"  [SKIP] weak-cert hygiene ({type(exc).__name__}: {exc})", file=sys.stderr)
     # --- exposed services
-    check([lbl for lbl, _, _ in exposed_services("22,80,445,6379,9999")] == ["smb", "redis"],
+    check([e[0] for e in exposed_services("22,80,445,6379,9999")] == ["smb", "redis"],
           "exposed services ordered by severity")
     check(exposed_services("") == [] and exposed_services("80,443") == [], "no exposed services")
     r = AuditRecord(domain="x.test"); r.ports = "445,6379,3306,23"
+    r.port_services = "23:telnet(banner);445:smb(banner);3306:mysql(banner);6379:redis(banner)"
     check(any(n.startswith("Exposed services") and n.endswith(f"(+{PORT_RISK_CAP})") for n in score_risk(r)[1]),
           "exposed services score capped")
+    # A port number alone is not a service (S07): banner decides, port guess scores half.
+    check(identify_service(10000, "HTTP/1.0 200 Document follows Server: MiniServ/2.105") == ("webmin", "banner"),
+          "service: Webmin confirmed by its MiniServ banner")
+    check(identify_service(10000, "HTTP/1.1 200 OK Server: nginx") == ("http", "banner"),
+          "service: plain web server on 10000 is not Webmin")
+    check(identify_service(10000, "") == ("webmin", "port-guess"), "service: no banner = port guess")
+    check(describe_port_services([22, 10000], {22: "SSH-2.0-OpenSSH_9.6"}) == "22:ssh(banner);10000:webmin?(port-guess)",
+          "service: port_services marks guesses with ?")
+    check(exposed_services("10000", "10000:http(banner)") == [], "service: contradicting banner drops the port")
+    check(exposed_services("10000", "10000:webmin?(port-guess)") == [("webmin", "medium", 10000, False)],
+          "service: unconfirmed port stays, marked unconfirmed")
+    _a, _b = socket.socketpair()
+    def _two_packets():
+        _b.sendall(b"HTTP/1.0 302 Moved Temporarily\r\n")
+        time.sleep(0.15)
+        _b.sendall(b"Date: x\r\nServer: MiniServ\r\n\r\n")
+    threading.Thread(target=_two_packets, daemon=True).start()
+    try:
+        _ban = _grab_banner(_a, 22)
+    finally:
+        _a.close(); _b.close()
+    check(identify_service(10000, _ban)[0] == "webmin", "banner: a banner split over two packets is read whole")
+    check(describe_port_services([443], {443: "HTTP/1.1 400 Bad Request"}, {443}) == "443:https(tls-handshake)",
+          "service: 443 with a TLS handshake is https")
+    r2 = AuditRecord(domain="x.test"); r2.ports = "10000"; r2.port_services = "10000:webmin?(port-guess)"
+    check(score_parts(r2)["exposure"] == PORT_RISK_POINTS["medium"] // 2 and score_parts(r2)["confidence"] == "Low",
+          "service: unconfirmed port scores half, low confidence")
 
     # --- cookies
     c = parse_set_cookie("sid=abc; Path=/; Secure; HttpOnly; SameSite=Lax")
@@ -3460,6 +4295,7 @@ def selftest() -> int:
     analyze_cookies([resp], cr)
     check("JSESSIONID" in cr.cookie_no_secure and "theme" not in cr.cookie_no_secure, "cookie Secure flagging")
     check(cr.session_cookie_no_httponly == "JSESSIONID", "session cookie HttpOnly flagging")
+    check(cr.cookie_context.startswith("JSESSIONID*@https://c.test/"), "cookie context: setter URL, session marked")
 
     # --- email transport hardening
     check(mx_hosts("10 mail.a.com,20 B.com") == ["mail.a.com", "b.com"], "mx_hosts parse")
@@ -3622,13 +4458,16 @@ def selftest() -> int:
               "response body capped at MAX_BODY_BYTES and flagged truncated")
     finally:
         _srv.shutdown()
-    check(FIELDNAMES[-3:] == ["body_truncated", "technology", "platform_risk"],
-          "technology and platform_risk are the last columns (existing order unchanged)")
+    _i = FIELDNAMES.index("platform_risk")
+    check(FIELDNAMES[_i - 2:_i + 2] == ["body_truncated", "technology", "platform_risk", "root_domain"]
+          and FIELDNAMES.index("domain") == 0,
+          "existing column order unchanged; 26.11.1 columns appended after platform_risk")
     _pr = assess_platforms("PHP/8.1.4; nginx/1.18.0; jQuery/1.11.1; Apache/2.4.58", "IdeaWebServer/6.4.2",
                            today="2026-10-26", rules=PLATFORMS)
     check("PHP/8.1.4: end-of-life 2025-12-31" in _pr and "nginx/1.18.0" in _pr and "jQuery/1.11.1: below 3.5.0" in _pr
           and "IdeaWebServer: non-enterprise" in _pr and "Apache/2.4.58" not in _pr,
           f"platform_risk flags EOL, old and non-enterprise: {_pr[:80]}")
+    check("home.pl" in _pr and "JetBrains" not in _pr, "platform_risk: IdeaWebServer is shared hosting, not an IDE")
     check(assess_platforms("PHP/8.2.34", today="2026-10-26", rules=PLATFORMS).startswith("PHP/8.2.34: support ends 2026-12-31"),
           "platform_risk warns 6 months ahead of PHP 8.2 support end")
     check(assess_platforms("PHP/8.4.25; nginx/1.24.0; jQuery/3.7.1", today="2026-10-26", rules=PLATFORMS) == "",
@@ -3724,6 +4563,107 @@ def selftest() -> int:
                                 "risk_score": 5}], "t", "src")
     check("<script>alert(1)</script>" not in page and "&lt;script&gt;alert(1)" in page,
           "report: record values HTML-escaped")
+
+    # --- 26.11.1 regression tests (reviewer findings S01-S17; DNS stubbed, local TLS only)
+    check(_hostname_matches("a.example.com", ["*.example.com"]) and not _hostname_matches("a.b.example.com", ["*.example.com"])
+          and _hostname_matches("example.com", ["EXAMPLE.com."]) and not _hostname_matches("example.com", ["*.example.com"]),
+          "hostname matching: one-label wildcard only")
+    t = {"handshake": "ok", "hostname": "fail", "trust": "self-signed", "dates": "expired", "protocol": "pass",
+         "valid": "N/A", "health": "N/A", "defects": "None"}
+    _summarise_tls(t)
+    check(t["defects"] == "expired;self-signed;hostname-mismatch" and t["valid"] == "expired" and t["health"] == "Degraded",
+          "TLS: every defect kept, expiry not hidden, health Degraded (S01/S02)")
+    t = {"handshake": "ok", "hostname": "pass", "trust": "pass", "dates": "pass", "protocol": "legacy(TLSv1.0)",
+         "valid": "N/A", "health": "N/A", "defects": "None"}
+    _summarise_tls(t)
+    check(t["valid"] == "valid" and t["health"] == "Degraded" and t["defects"] == "None",
+          "TLS: valid cert on a legacy protocol is not Healthy")
+    try:
+        _tls_selftest(check)
+    except ImportError:
+        print("  [SKIP] TLS handshake tests (cryptography not installed)", file=sys.stderr)
+
+    _saved = {k: globals()[k] for k in ("_target_claimable_nxdomain", "_resolve")}
+    try:
+        globals()["_target_claimable_nxdomain"] = lambda t: t.startswith("gone")
+        globals()["_resolve"] = lambda name, rtype: ("token",) if name.startswith("asuid.protected") else ()
+        check(detect_takeover(["live.azurewebsites.net"], "<h1>404 Not Found</h1>")[0] == "No",
+              "takeover: a live Azure app's 404 is not a takeover (S03)")
+        risk, det = detect_takeover(["gone.azurewebsites.net"], "")
+        tk = assess_takeover("open.example.com", ["gone.azurewebsites.net"], risk, det)
+        check(risk == "Yes" and tk["target_missing"] == "Yes" and tk["binding"] == "No"
+              and tk["recreatable"] == "unknown" and tk["confidence"] == "Medium" and tk["verified"] == "No (manual)",
+              "takeover: missing Azure app, no asuid record = Medium, unverified (S04)")
+        tk = assess_takeover("protected.example.com", ["gone.azurewebsites.net"], risk, det)
+        check(tk["binding"] == "Yes" and tk["confidence"] == "Low", "takeover: asuid verification record lowers confidence")
+        risk, det = detect_takeover(["gone.eastus.cloudapp.azure.com"], "")
+        check(assess_takeover("x.example.com", ["gone.eastus.cloudapp.azure.com"], risk, det)["confidence"] == "High",
+              "takeover: released cloudapp label with no target = High")
+        check(detect_takeover(["x.github.io"], "<title>404</title>")[0] == "Possibly",
+              "takeover: generic 404 body is an observation only")
+        check(detect_takeover(["x.github.io"], "There isn't a GitHub Pages site here.")[0] == "Yes",
+              "takeover: provider-specific unclaimed page is still Yes")
+        # S05: names that do not exist, or exist without addresses, are not dangling.
+        check(detect_dangling("a.example.com", [], [], False, "NXDOMAIN") == ("No", "Name does not exist", "nxdomain"),
+              "dangling: NXDOMAIN under a delegated zone is not dangling")
+        check(detect_dangling("a.example.com", [], [], False, "NOANSWER")[2] == "no-web-records",
+              "dangling: a name with only MX/TXT is not dangling")
+        check(detect_dangling("a.example.com", [], [], False, "SERVFAIL")[2] == "dns-failure",
+              "dangling: SERVFAIL without a delegation is a DNS failure")
+    finally:
+        globals().update(_saved)
+
+    nx = AuditRecord(domain="gone.example.com")
+    nx.dns_status, nx.is_subdomain = "NXDOMAIN", "Yes"
+    nx.spf_issues, nx.dmarc_issues = "spf_missing", "dmarc_missing"
+    classify_domain(nx, [], [])
+    check(score_risk(nx)[0] == 0 and "spf-missing" not in nx.config_issues,
+          "score: a name that does not exist gets no SPF/DMARC/CAA points (S09)")
+    ap = AuditRecord(domain="example.com")
+    ap.dns_status, ap.spf_issues, ap.dmarc_issues = "OK", "spf_missing", "dmarc_missing"
+    check(score_parts(ap)["hygiene"] == 40 and score_parts(ap)["exposure"] == 0,
+          "score: an existing registered domain without SPF/DMARC/CAA scores as hygiene")
+    sd = AuditRecord(domain="www.example.com")
+    sd.dns_status, sd.is_subdomain, sd.spf_issues = "OK", "Yes", "spf_missing"
+    check(score_parts(sd)["hygiene"] == 0, "score: SPF on a subdomain without MX is not applicable")
+
+    check(host_root("a.b.example.com") == "example.com" and host_root("a.b.example.com", {"b.example.com"}) == "b.example.com"
+          and host_root("example") == "example", "roots: longest configured root, else registrable domain (S10)")
+    hr = AuditRecord(domain="h.example.com")
+    hr.ip, hr.ptr = "203.0.113.7", "ec2-203-0-113-7.compute-1.amazonaws.com"
+    check(classify_hosting(hr, False, []) == ("aws", "cloud", "not-verified")
+          and classify_hosting(hr, False, ["aws"])[2] == "org-provider(aws)"
+          and classify_hosting(hr, True, [])[1:] == ("org", "org-network"),
+          "hosting: network location is not management (S08)")
+    hr.cname = "x.privatelink.example.net"
+    check(private_endpoint(hr) == "Yes(name:privatelink)", "private endpoint marker (S15)")
+
+    ck_args = build_parser().parse_args([])
+    cr2 = AuditRecord(domain="example.com")
+    cr2.dns_status, cr2.ip, cr2.https_status = "OK", "203.0.113.7", "200"
+    states = parse_checks(describe_checks(cr2, ck_args, TOP_PORTS))
+    check(states.get("scanner") == "not_run" and states.get("cors") == "not_run" and states.get("http") == "passed"
+          and set(states.values()) <= set(CHECK_STATES), "checks: typed states, not-run is explicit (S12)")
+
+    old = [{"domain": "t.test", "config_issues": "hsts-missing", "risk_score": 5}]
+    new = [{"domain": "t.test", "config_issues": "None", "risk_score": 0, "checks": "dns=timeout"}]
+    d = diff_results(old, new)
+    check(d["transient"] and not d["resolved_issues"], "diff: an issue not re-checked is transient, not resolved (S17)")
+
+    st = RunStats()
+    for ip, cert in (("192.0.2.1", "c1"), ("192.0.2.1", "c1"), ("192.0.2.2", "c2")):
+        sr = AuditRecord(domain="s.test"); sr.ip, sr.cert_sha256 = ip, cert
+        st.add(sr)
+    check(st.as_dict()["hostnames"] == 3 and st.as_dict()["distinct_ips"] == 2
+          and st.as_dict()["distinct_certificates"] == 2, "counts: hostnames vs distinct IPs/certs (S13)")
+    with tempfile.TemporaryDirectory() as td:
+        ma = build_parser().parse_args(["--input", "-"])
+        ma.roots, ma.managed_providers, ma.approved_mx, ma.approved_redirect = frozenset(), [], [], []
+        mp = write_manifest(os.path.join(td, "out.jsonl"), ma, None, "t0", "t1", ["a.test"], st)
+        with open(mp) as fh:
+            m = json.load(fh)
+        check(m["clipeus_version"] == __version__ and m["counts"]["hostnames"] == 3 and m["input"]["hosts"] == 1,
+              "manifest: version, inputs and unit-labelled counts (S14)")
 
     print(f"selftest: {'ALL PASS' if ok else 'FAILURES'}", file=sys.stderr)
     return 0 if ok else 1
@@ -4183,7 +5123,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ports", choices=["none", "top", "standard", "full"], default="top")
     p.add_argument("--ports-behind-cdn", action="store_true",
                    help="Port-scan even when a CDN/WAF is detected (default: skip)")
-    p.add_argument("--banners", action="store_true", help="Grab TCP banners on open ports")
+    p.add_argument("--banners", action="store_true", help=argparse.SUPPRESS)  # legacy; banners are on by default
+    p.add_argument("--no-banners", action="store_true",
+                   help="Don't read service banners on open ports (then services are port guesses only)")
+    p.add_argument("--roots", metavar="FILE",
+                   help="Portfolio roots, one per line: sets root_domain / is_subdomain "
+                        "(default: config roots, else each host's registrable domain)")
+    p.add_argument("--no-manifest", action="store_true",
+                   help="Don't write <output>.manifest.json (run provenance: version, rules, inputs, counts)")
     p.add_argument("--harvest", action="store_true",
                    help="Harvest robots.txt / sitemap.xml / security.txt paths")
     p.add_argument("--jarm", action="store_true", help="Real JARM via external `jarm` tool")
@@ -4342,6 +5289,11 @@ def main() -> None:
                 "certspotter_max_wait": CERTSPOTTER_MAX_WAIT,
                 "max_body_bytes": MAX_BODY_BYTES,
                 "nxdomain_only_providers": list(NXDOMAIN_ONLY_PROVIDERS),
+                "takeover_name_policy": TAKEOVER_NAME_POLICY,
+                "takeover_binding_txt": TAKEOVER_BINDING_TXT,
+                "cloud_provider_markers": sorted(CLOUD_PROVIDER_MARKERS),
+                "private_endpoint_markers": list(PRIVATE_ENDPOINT_MARKERS),
+                "rules_version": refresh_rules_version(),
             },
             "external_overrides": {
                 "resolvers": "--resolvers FILE | $CLIPEUS_RESOLVERS | config resolvers | tuning dns_servers | default",
@@ -4377,6 +5329,14 @@ def main() -> None:
 
     args.approved_mx = _domain_list(args.approved_mx, "approved_mx")
     args.approved_redirect = _domain_list(args.approved_redirect, "approved_redirect")
+    args.managed_providers = list(brand_cfg.get("managed_providers", []))
+    roots = list(brand_cfg.get("roots", []))
+    if args.roots:
+        try:
+            roots = [h for h in (normalize_host(ln) for ln in open(args.roots, encoding="utf-8")) if h]
+        except OSError as exc:
+            sys.exit(f"error: --roots {exc}")
+    args.roots = frozenset(roots)
 
     global RL, INGEST
     RL = RateLimiter(args.rate)
@@ -4397,6 +5357,7 @@ def main() -> None:
         except (OSError, ValueError) as exc:
             sys.exit(f"error: --takeover-sigs {args.takeover_sigs}: {exc}")
         print(f"[*] loaded {n} takeover fingerprints from {args.takeover_sigs}", file=sys.stderr)
+    refresh_rules_version()
 
     # Resolvers: one precedence shared by every Clipeus tool (brand_config.effective_resolvers):
     # --resolvers FILE / $CLIPEUS_RESOLVERS > config "resolvers" > tuning "dns_servers" > default.
@@ -4486,7 +5447,6 @@ def main() -> None:
         f"workers={args.workers} accurate={args.accurate} ports={args.ports}")
 
     # Subdomain enumeration pre-pass (subfinder + crt.sh CT) -> subs_file, audited too.
-    sub_targets: set = set()
     if args.subs_file or args.ct_tld:
         subs_out = args.subs_file or "/tmp/clipeus_subs.txt"
         log(f"[*] enumerating subdomains (subfinder{'' if args.no_ct else ' + crt.sh'}"
@@ -4505,7 +5465,6 @@ def main() -> None:
         log(f"[*] subdomain enumeration done: +{len(subs)} subdomains")
         existing = set(domains)
         for s in subs:
-            sub_targets.add(s)
             if s not in existing:
                 existing.add(s)
                 domains.append(s)
@@ -4530,6 +5489,8 @@ def main() -> None:
     emit = EmitSink(args.emit, args.emit_file) if args.emit else None
     session = build_session(args.timeout)
     completed = 0
+    stats = RunStats()
+    started = _utc_now()
 
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -4537,8 +5498,7 @@ def main() -> None:
                        for d in todo}
             for fut in as_completed(futures):
                 rec = fut.result()
-                if rec.domain in sub_targets:
-                    rec.is_subdomain = "Yes"
+                stats.add(rec)
                 writer.write(rec)
                 if emit:
                     emit.feed(rec)
@@ -4558,6 +5518,9 @@ def main() -> None:
             emit.close()
 
     log(f"[*] Done. {completed} records -> {args.output}")
+    if args.output != "-" and not args.no_manifest:
+        mpath = write_manifest(args.output, args, brand_path, started, _utc_now(), domains, stats)
+        log(f"[*] manifest -> {mpath}")
     if (args.baseline or args.report_html) and completed:
         post_process(args.output, args.baseline, args.report_html, args.diff_out, log)
     if log_fh:
