@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.1"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.2"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -393,10 +393,13 @@ WEAK_TAKEOVER_SIGNATURES = {"404", "error 404", "page not found", "not found", "
 # Can a deleted resource's provider name be registered again by anyone? "released" only
 # where that is the provider's documented behaviour; everything else stays "unknown"
 # until an analyst checks the provider (some reserve names, or offer unique hostnames).
+# Keys match as substrings of the CNAME target; the longest matching key wins, so a
+# service inside a provider domain can differ from the domain (S3 buckets vs ELB names).
 TAKEOVER_NAME_POLICY = {
     "cloudapp.azure.com": "released", "cloudapp.net": "released",
     "trafficmanager.net": "released", "elasticbeanstalk.com": "released",
-    "amazonaws.com": "released", "s3-website": "released",
+    ".s3.amazonaws.com": "released", ".s3-": "released", ".s3.": "released", "s3-website": "released",
+    "elb.amazonaws.com": "reserved (random load-balancer id)",
 }
 TAKEOVER_NAME_POLICY.update(_tune("takeover_name_policy", {}))
 
@@ -559,16 +562,24 @@ def normalize_host(line: str) -> Optional[str]:
     except ValueError:
         pass
     if s.isascii():
-        return s  # already a plain ASCII hostname
+        return s if _HOST_RE.match(s) else None  # plain ASCII hostname
+    out = None
     if _HAVE_IDNA:
         try:
-            return idna.encode(s, uts46=True).decode("ascii")
+            out = idna.encode(s, uts46=True).decode("ascii")
         except idna.IDNAError:
             pass
-    try:
-        return s.encode("idna").decode("ascii")
-    except Exception:
-        return None  # non-ASCII that cannot be IDNA-encoded is not a valid host
+    if out is None:
+        try:
+            out = s.encode("idna").decode("ascii")
+        except Exception:
+            return None  # non-ASCII that cannot be IDNA-encoded is not a valid host
+    return out if _HOST_RE.match(out) else None
+
+
+# Hostname syntax after IDNA encoding: labels of letters, digits, '-' and '_' (service
+# labels such as _dmarc). Anything else, e.g. spaces carried through IDNA, is not a host.
+_HOST_RE = re.compile(r"^(?!-)[a-z0-9_-]{1,63}(?:\.(?!-)[a-z0-9_-]{1,63})*$")
 
 
 # =====================================================================
@@ -736,6 +747,18 @@ class AuditRecord:
     scanned_at: str = ""               # UTC time this record was produced
     clipeus_version: str = ""
     rules_version: str = ""            # hash of the takeover / port / platform rules in effect
+    # --- Appended in 26.11.2. ---
+    takeover_outcome: str = "N/A"      # none / provider-binding-review / protected / dangling-reserved /
+                                       # potentially-reclaimable / claimable-by-policy /
+                                       # claimable-by-signature / claimable-ns-domain / verified
+    takeover_evidence: str = "N/A"     # the observations the outcome was derived from
+    ns_parent: str = "N/A"             # NS the parent zone's referral delegates this name to
+    ns_own: str = "N/A"                # NS the name's own zone answers with (child side)
+    ns_resolution: str = "N/A"         # nameserver=address|NXDOMAIN|NOANSWER|TIMEOUT;...
+    ns_registration: str = "N/A"       # registrable domain of each unresolvable NS = registration result
+    rdap_result: str = "N/A"           # ok / whois / not-registered / unsupported-tld / rate-limited /
+                                       # timeout / http-NNN / parse-error (per registrable domain)
+    overrides: str = "None"            # manual findings merged from --overrides: field=value (date, by; evidence)
 
 
 FIELDNAMES = [f.name for f in AuditRecord.__dataclass_fields__.values()]
@@ -983,22 +1006,117 @@ def registrable_domain(host: str) -> str:
     return last2
 
 
-@lru_cache(maxsize=50000)
-def get_rdap(domain: str) -> Tuple[str, str, str, str, str, dict]:
-    """RDAP over HTTPS (no dependency). Returns registrar, created, expires,
-    age_days, status, raw. Great for spotting freshly-registered look-alikes."""
-    reg = registrable_domain(domain)
-    RL.wait()
-    try:
-        # RDAP servers commonly 403 browser-like UAs; use a neutral client UA.
-        r = requests.get(f"https://rdap.org/domain/{reg}", timeout=8,
-                         headers={"User-Agent": f"clipeus/{__version__} (RDAP client)"})
-        if r.status_code != 200:
-            return "N/A", "N/A", "N/A", "N/A", "N/A", {}
-        d = r.json()
-    except Exception:
-        return "N/A", "N/A", "N/A", "N/A", "N/A", {}
+RDAP_RETRIES = 3              # attempts per registrable domain (429 / 5xx / timeout)
+RDAP_BACKOFF = (2.0, 5.0)     # seconds between attempts unless Retry-After says less (cap 10 s)
 
+
+def _age_days(created: str) -> str:
+    if created in ("N/A", ""):
+        return "N/A"
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(created)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return str((datetime.now(timezone.utc) - dt).days)
+    except Exception:
+        return "N/A"
+
+
+RDAP_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
+_RDAP_BOOTSTRAP: Optional[Dict[str, str]] = None   # TLD -> registry RDAP base; {} = unavailable
+_RDAP_BOOTSTRAP_LOCK = threading.Lock()
+
+
+def _rdap_base(reg: str) -> Optional[str]:
+    """The registry's own RDAP server for this domain, from the IANA bootstrap (loaded once
+    per run). Querying registries directly avoids a shared redirector's rate limit, and a
+    TLD missing from the bootstrap has no RDAP: "" means that, None means the bootstrap
+    could not be loaded (then rdap.org is used)."""
+    global _RDAP_BOOTSTRAP
+    with _RDAP_BOOTSTRAP_LOCK:
+        if _RDAP_BOOTSTRAP is None:
+            try:
+                r = requests.get(RDAP_BOOTSTRAP_URL, timeout=15,
+                                 headers={"User-Agent": f"clipeus/{__version__} (RDAP client)"})
+                svc = r.json().get("services", []) if r.status_code == 200 else []
+                _RDAP_BOOTSTRAP = {t.lower(): urls[0] for tlds, urls in svc for t in tlds if urls}
+            except Exception:
+                _RDAP_BOOTSTRAP = {}
+    if not _RDAP_BOOTSTRAP:
+        return None
+    labels = reg.lower().split(".")
+    for i in range(len(labels)):
+        base = _RDAP_BOOTSTRAP.get(".".join(labels[i:]))
+        if base:
+            return base
+    return ""
+
+
+def _registry_is_authoritative(reg: str) -> bool:
+    """Can the TLD registry say this name is unregistered? Yes for name.tld, and for
+    second levels a ccTLD registry runs (example.co.uk). Not for names under a privately
+    run suffix of a generic TLD (example.eu.com): the .com registry only knows eu.com."""
+    labels = reg.split(".")
+    return len(labels) <= 2 or len(labels[-1]) == 2
+
+
+def _rdap_query(reg: str) -> Dict[str, Any]:
+    """One RDAP lookup with retries. `result` says why a field is empty: ok,
+    not-registered (the registry answered 404), unsupported-tld (no RDAP server known),
+    rate-limited, timeout, http-NNN, parse-error. A failed lookup is never read as
+    "not registered"."""
+    out: Dict[str, Any] = {"registrar": "N/A", "created": "N/A", "expires": "N/A",
+                           "status": "N/A", "raw": {}, "result": "error"}
+    base = _rdap_base(reg)
+    if base == "":
+        out["result"] = "unsupported-tld"
+        return out
+    url = f"{base.rstrip('/')}/domain/{reg}" if base else f"https://rdap.org/domain/{reg}"
+    for attempt in range(RDAP_RETRIES):
+        if STOP.is_set():
+            break
+        RL.wait()
+        try:
+            # RDAP servers commonly 403 browser-like UAs; use a neutral client UA.
+            r = requests.get(url, timeout=8,
+                             headers={"User-Agent": f"clipeus/{__version__} (RDAP client)"})
+        except requests.Timeout:
+            out["result"] = "timeout"
+        except requests.RequestException:
+            out["result"] = "error"
+        else:
+            if r.status_code == 200:
+                try:
+                    d = r.json()
+                except ValueError:
+                    out["result"] = "parse-error"
+                    return out
+                out.update(_parse_rdap(d), result="ok")
+                return out
+            if r.status_code == 404:
+                # A registry's 404 means no such registration. Through rdap.org (bootstrap
+                # unavailable) only a 404 after the redirect to a registry means that.
+                if not (base or r.history):
+                    out["result"] = "unsupported-tld"
+                else:
+                    out["result"] = ("not-registered" if _registry_is_authoritative(reg)
+                                     else "not-found(tld-registry)")
+                return out
+            if r.status_code != 429 and r.status_code < 500:
+                out["result"] = f"http-{r.status_code}"
+                return out
+            out["result"] = "rate-limited" if r.status_code == 429 else f"http-{r.status_code}"
+            wait = r.headers.get("Retry-After", "")
+            if wait.isdigit() and attempt < RDAP_RETRIES - 1:
+                time.sleep(min(int(wait), 10))
+                continue
+        if attempt < RDAP_RETRIES - 1:
+            time.sleep(RDAP_BACKOFF[min(attempt, len(RDAP_BACKOFF) - 1)])
+    return out
+
+
+def _parse_rdap(d: dict) -> Dict[str, Any]:
     registrar = "N/A"
     for ent in d.get("entities", []):
         if "registrar" in ent.get("roles", []):
@@ -1013,21 +1131,51 @@ def get_rdap(domain: str) -> Tuple[str, str, str, str, str, dict]:
             created = ev.get("eventDate", "N/A")[:10]
         elif act == "expiration":
             expires = ev.get("eventDate", "N/A")[:10]
-    age_days = "N/A"
-    if created != "N/A":
-        try:
-            from datetime import datetime, timezone
-            dt = datetime.fromisoformat(created)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            age_days = str((datetime.now(timezone.utc) - dt).days)
-        except Exception:
-            pass
     status = ",".join(d.get("status", [])) or "N/A"
     raw = {"registrar": registrar, "status": d.get("status", []),
            "events": d.get("events", []), "nameservers":
            [n.get("ldhName") for n in d.get("nameservers", [])]}
-    return registrar, created, expires, age_days, status, raw
+    return {"registrar": registrar, "created": created, "expires": expires,
+            "status": status, "raw": raw}
+
+
+_REG_CACHE: Dict[Tuple[str, bool], Dict[str, Any]] = {}
+_REG_LOCKS: Dict[Tuple[str, bool], threading.Lock] = {}
+_REG_GUARD = threading.Lock()
+
+
+def lookup_registration(reg: str, use_whois: bool = True) -> Dict[str, Any]:
+    """Registration data for a registrable domain, looked up once per run however many
+    hostnames sit under it (one lookup per host rate-limits the RDAP service and turns
+    good domains into errors). RDAP first; WHOIS when RDAP gives no answer."""
+    key = (reg, use_whois)
+    with _REG_GUARD:
+        lock = _REG_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        if key in _REG_CACHE:
+            return _REG_CACHE[key]
+        res = _rdap_query(reg)
+        if use_whois and res["result"] not in ("ok", "not-registered"):
+            w_reg, w_created, w_status, w_src, w_raw = whois_fallback(reg)
+            if w_status == "unregistered":
+                res["result"] = ("not-registered(whois)" if _registry_is_authoritative(reg)
+                                 else "not-found(tld-registry)")
+            elif w_reg != "N/A" or w_created != "N/A":
+                res.update(registrar=f"{w_reg} (whois)" if w_reg != "N/A" else "N/A",
+                           created=w_created, result="whois")
+                if w_status != "N/A":
+                    res["status"] = w_status
+            if w_src != "N/A":
+                res["whois_raw"] = {"source": w_src, **w_raw}
+        res["age_days"] = _age_days(res["created"])
+        _REG_CACHE[key] = res
+        return res
+
+
+def get_rdap(domain: str) -> Tuple[str, str, str, str, str, dict]:
+    """Back-compatible tuple view of lookup_registration (RDAP only)."""
+    r = lookup_registration(registrable_domain(domain), use_whois=False)
+    return r["registrar"], r["created"], r["expires"], r["age_days"], r["status"], r["raw"]
 
 
 # TLD -> whois server for the fallback path (RDAP-less registries like SWITCH/.ch).
@@ -1077,7 +1225,7 @@ def whois_fallback(domain: str) -> Tuple[str, str, str, str, dict]:
     low = resp.lower()
     # Registered? Most registries echo the domain or say "no match" when free.
     if any(m in low for m in ("no match", "not found", "no entries found",
-                              "no object found", "is available")):
+                              "no object found", "is available", "no data found")):
         return "N/A", "N/A", "unregistered", server, {"raw": resp[:2000]}
 
     def grab(labels):
@@ -1254,6 +1402,11 @@ def _parent_delegation(domain: str, zone_ns: List[str]) -> Tuple[str, ...]:
     """NS names the enclosing zone delegates `domain` to, read from that zone's own
     referral (non-recursive query), so a delegation whose servers no longer answer is
     still visible."""
+    return _parent_delegation_cached(domain.lower(), tuple(zone_ns))
+
+
+@lru_cache(maxsize=20000)
+def _parent_delegation_cached(domain: str, zone_ns: Tuple[str, ...]) -> Tuple[str, ...]:
     for server in zone_ns[:3]:
         try:
             ip = RESOLVER.resolve(server, "A")[0].to_text()
@@ -1268,6 +1421,61 @@ def _parent_delegation(domain: str, zone_ns: List[str]) -> Tuple[str, ...]:
         except Exception:
             continue
     return ()
+
+
+@lru_cache(maxsize=20000)
+def _enclosing_zone(domain: str) -> Tuple[str, Tuple[str, ...]]:
+    """The closest zone above `domain` that has NS records, and those NS."""
+    parts = domain.split(".")
+    for i in range(1, len(parts)):
+        name = ".".join(parts[i:])
+        ns = _resolve(name, "NS")
+        if ns:
+            return name, tuple(sorted(ns))
+    return "", ()
+
+
+@lru_cache(maxsize=20000)
+def _ns_address(name: str) -> str:
+    """First IPv4 address of a nameserver, or why there is none."""
+    try:
+        return RESOLVER.resolve(name, "A")[0].to_text()
+    except dns.resolver.NXDOMAIN:
+        return "NXDOMAIN"
+    except dns.resolver.NoAnswer:
+        return "AAAA-only" if _resolve(name, "AAAA") else "NOANSWER"
+    except dns.exception.Timeout:
+        return "TIMEOUT"
+    except Exception:
+        return "ERROR"
+
+
+def delegation_evidence(domain: str, own_ns: List[str], zone: str, zone_ns: List[str],
+                        has_resolution: bool, dns_status: str, use_whois: bool = True
+                        ) -> Dict[str, Any]:
+    """Both sides of a delegation, kept apart: the parent zone's referral and the name's
+    own NS answer, each nameserver's address, and for every nameserver that does not
+    exist, whether its registrable domain is registered. Collected only where the name
+    is a zone cut or its resolution failed (where a delegation can dangle)."""
+    failed = not has_resolution and dns_status in ("SERVFAIL", "TIMEOUT", "ERROR")
+    if not own_ns and not failed:
+        return {}
+    if own_ns:
+        _zone, parent_servers = _enclosing_zone(domain)
+    else:                       # the NS walk already stopped at the enclosing zone
+        parent_servers = tuple(zone_ns) if zone != domain else ()
+    parent = _parent_delegation(domain, list(parent_servers)) if parent_servers else ()
+    names = sorted(set(parent) | set(own_ns))
+    if not names:
+        return {}
+    addr = {n: _ns_address(n) for n in names}
+    regs: Dict[str, str] = {}
+    for n, a in addr.items():
+        if a == "NXDOMAIN":
+            r = registrable_domain(n)
+            if r and r not in regs:
+                regs[r] = lookup_registration(r, use_whois)["result"]
+    return {"parent": tuple(parent), "own": tuple(own_ns), "addresses": addr, "registration": regs}
 
 
 def detect_dangling(domain: str, chain: List[str], ns: List[str], has_resolution: bool,
@@ -1400,34 +1608,81 @@ def detect_takeover(chain: List[str], body: str) -> Tuple[str, str]:
     return "No", "N/A"
 
 
-def assess_takeover(host: str, chain: List[str], risk: str, detail: str) -> Dict[str, str]:
-    """Evidence behind a takeover verdict, kept apart from the verdict itself: is the
-    target gone, can its name be registered again, is the hostname protected by a
-    verification record. Claimability is never tested (that would mean claiming it)."""
-    out = {"target_missing": "N/A", "recreatable": "N/A", "binding": "N/A",
+# Azure App Service "secure unique default hostname": app-<16 chars>.<region>-NN.azurewebsites.net.
+# Such a name embeds a random hash, so nobody can create another app with it.
+_UNIQUE_DEFAULT_HOST_RE = re.compile(r"-[a-z0-9]{16}\.[a-z0-9]+-\d{2}\.azurewebsites\.net$")
+TAKEOVER_OUTCOMES = ("none", "provider-binding-review", "protected", "dangling-reserved",
+                     "potentially-reclaimable", "claimable-by-policy", "claimable-by-signature",
+                     "claimable-ns-domain", "verified")
+
+
+def assess_takeover(host: str, chain: List[str], risk: str, detail: str,
+                    ns_ev: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """Final takeover verdict, derived only from the evidence fields. `risk`/`detail` are
+    detect_takeover's observation; the returned risk/detail replace them, so a protected
+    or unverified record never carries an unconditional "claimable". Claimability is
+    never tested (that would mean claiming it): the best outcome without an analyst's
+    override is claimable-by-policy / -signature / -ns-domain, all "claim not verified"."""
+    out = {"risk": "No", "detail": "N/A", "outcome": "none", "evidence": "N/A",
+           "target_missing": "N/A", "recreatable": "N/A", "binding": "N/A",
            "confidence": "N/A", "verified": "N/A"}
-    if risk not in ("Yes", "Possibly") or not chain:
-        return out
-    provider = next((p for tgt in chain for p in TAKEOVER_PROVIDERS if p in tgt.lower()), "")
-    if "NXDOMAIN" in detail:
-        out["target_missing"] = "Yes"
-    elif "signature '" in detail and risk == "Yes":
-        out["target_missing"] = "provider-unclaimed"
-    else:
-        out["target_missing"] = "No"
-    out["recreatable"] = TAKEOVER_NAME_POLICY.get(provider, "unknown")
-    tmpl = TAKEOVER_BINDING_TXT.get(provider)
-    if tmpl:
-        out["binding"] = "Yes" if _resolve(tmpl.format(host=host), "TXT") else "No"
-    else:
-        out["binding"] = "none-known"
-    if risk == "Possibly" or out["binding"] == "Yes":
-        out["confidence"] = "Low"
-    elif out["target_missing"] == "Yes" and out["recreatable"] == "released":
-        out["confidence"] = "High"
-    else:
-        out["confidence"] = "Medium"
-    out["verified"] = "No (manual)"
+    if risk in ("Yes", "Possibly") and chain:
+        provider = next((p for tgt in chain for p in TAKEOVER_PROVIDERS if p in tgt.lower()), "")
+        target = chain[-1].lower()
+        if "NXDOMAIN" in detail or ("signature '" not in detail and _target_claimable_nxdomain(target)):
+            out["target_missing"], seen = "Yes", "target NXDOMAIN"
+        elif "signature '" in detail and risk == "Yes":
+            sig = detail.split("signature '", 1)[1].rstrip("'")
+            out["target_missing"], seen = "provider-unclaimed", f"provider page '{sig}'"
+        else:
+            out["target_missing"] = "No"
+            seen = "target resolves" + (f"; generic '{detail.split(chr(39))[1]}' page" if "generic '" in detail else "")
+        policy = TAKEOVER_NAME_POLICY.get(max((k for k in TAKEOVER_NAME_POLICY if k in target),
+                                              key=len, default=""), "unknown")
+        if _UNIQUE_DEFAULT_HOST_RE.search(target):
+            out["recreatable"] = "reserved (unique default hostname)"
+        elif policy == "released":
+            out["recreatable"] = "released (provider policy)"
+        else:
+            out["recreatable"] = policy
+        tmpl = TAKEOVER_BINDING_TXT.get(provider)
+        if tmpl:
+            out["binding"] = "Yes" if _resolve(tmpl.format(host=host), "TXT") else "No"
+        else:
+            out["binding"] = "none-known"
+        if out["target_missing"] == "No":
+            out["outcome"] = "provider-binding-review"
+        elif out["binding"] == "Yes":
+            out["outcome"] = "protected"
+        elif out["recreatable"].startswith("reserved"):
+            out["outcome"] = "dangling-reserved"
+        elif out["target_missing"] == "provider-unclaimed":
+            out["outcome"], out["risk"], out["confidence"] = "claimable-by-signature", "Yes", "High"
+        elif out["recreatable"].startswith("released"):
+            out["outcome"], out["risk"], out["confidence"] = "claimable-by-policy", "Yes", "High"
+        else:
+            out["outcome"], out["risk"], out["confidence"] = "potentially-reclaimable", "Possibly", "Medium"
+        bind = {"Yes": "verification record present", "No": "no verification record",
+                "none-known": "no verification scheme known"}[out["binding"]]
+        out["detail"] = f"{out['outcome']}: {provider} {seen}; name {out['recreatable']}; {bind}"
+        out["evidence"] = (f"provider={provider};target={target};target_missing={out['target_missing']};"
+                           f"recreatable={out['recreatable']};binding={out['binding']}")
+    elif ns_ev and ns_ev.get("registration"):
+        addr, regs = ns_ev["addresses"], ns_ev["registration"]
+        free = sorted(r for r, res in regs.items() if res.startswith("not-registered"))
+        if free:
+            hit = [n for n, a in addr.items() if a == "NXDOMAIN" and registrable_domain(n) in free]
+            alive = [n for n, a in addr.items() if a not in ("NXDOMAIN",)]
+            out.update(outcome="claimable-ns-domain", risk="Yes", target_missing="Yes",
+                       recreatable="registrable (registry: not registered)", binding="N/A",
+                       confidence="Medium" if alive else "High")
+            out["detail"] = (f"claimable-ns-domain: delegated to {','.join(hit)}; "
+                             f"{','.join(free)} not registered; {len(hit)} of {len(addr)} nameservers")
+            out["evidence"] = ";".join(f"{r}={regs[r]}" for r in sorted(regs))
+    if out["outcome"] != "none":
+        out["verified"] = "No (manual)"
+        if out["risk"] != "No":
+            out["detail"] += "; claim not verified"
     return out
 
 
@@ -2782,18 +3037,19 @@ def score_parts(rec: AuditRecord) -> Dict[str, Any]:
     # --- exposure
     if rec.axfr_vuln == "Vulnerable":
         add("exposure", 40, "AXFR")
-    if rec.dangling_status == "Yes":
-        add("exposure", 45, f"Dangling ({rec.dangling_class})")
-    elif rec.dangling_status == "Possibly":
-        pts = 10 if rec.dangling_class == "unresponsive-cloud-ip" else 25
-        add("exposure", pts, f"Possibly dangling ({rec.dangling_class})", confirmed=False)
+    # Takeover and dangling score once, from the derived verdict: a claimable name is
+    # exposure; a stale record nobody else can claim is hygiene.
     if rec.takeover_risk == "Yes":
-        if rec.takeover_confidence == "Low":
-            add("exposure", 20, "Takeover candidate (hostname verification record present)", confirmed=False)
-        else:
-            add("exposure", 45, f"Takeover ({rec.takeover_confidence} confidence, claim not verified)")
+        verified = rec.takeover_outcome == "verified"
+        add("exposure", 45, f"Takeover ({rec.takeover_outcome}"
+            f"{'' if verified else ', claim not verified'})", confirmed=verified)
     elif rec.takeover_risk == "Possibly":
-        add("exposure", 15, "Possible takeover", confirmed=False)
+        add("exposure", 25, f"Possible takeover ({rec.takeover_outcome})", confirmed=False)
+    elif rec.dangling_class == "unresponsive-cloud-ip":
+        add("exposure", 10, "Possibly dangling (unresponsive-cloud-ip)", confirmed=False)
+    elif rec.dangling_status in ("Yes", "Possibly"):
+        add("hygiene", 10 if rec.dangling_status == "Yes" else 5,
+            f"Stale DNS record ({rec.dangling_class})", confirmed=rec.dangling_status == "Yes")
     if rec.is_private_ip == "Yes":
         add("exposure", 30, "Private IP exposed")
     if rec.has_login_form == "Yes" and rec.managed_by in ("not-verified", "N/A") and rec.org_range == "No":
@@ -3044,7 +3300,8 @@ def describe_checks(rec: AuditRecord, args: argparse.Namespace, port_list: List[
     if args.no_rdap:
         st["rdap"] = "not_run"
     else:
-        st["rdap"] = "passed" if rec.rdap_registrar != "N/A" else "error"
+        st["rdap"] = ("passed" if rec.rdap_result in ("ok", "whois") or rec.rdap_result.startswith("not-registered")
+                      else "timeout" if rec.rdap_result == "timeout" else "error")
     if args.no_tls:
         st["tls"] = "not_run"
     elif rec.tls_handshake in ("N/A", "no-listener"):
@@ -3080,8 +3337,9 @@ def describe_checks(rec: AuditRecord, args: argparse.Namespace, port_list: List[
         st["ports"] = "failed" if exposed_services(rec.ports, rec.port_services) else "passed"
     st["banners"] = "not_run" if (args.no_banners or not port_list) else (
         "passed" if rec.ports else "not_applicable")
-    st["takeover"] = ("not_applicable" if rec.cname == "N/A"
-                      else "failed" if rec.takeover_risk in ("Yes", "Possibly") else "passed")
+    st["takeover"] = ("failed" if rec.takeover_risk in ("Yes", "Possibly")
+                      else "not_applicable" if rec.cname == "N/A" and rec.ns_resolution == "N/A"
+                      else "passed")
     st["dangling"] = ("failed" if rec.dangling_status in ("Yes", "Possibly")
                       else "timeout" if rec.dangling_class == "dns-failure" and rec.dns_status == "TIMEOUT"
                       else "passed")
@@ -3161,26 +3419,13 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
             rec.asn, rec.country, rec.city = get_geo_asn(rec.ip)
 
         if not args.no_rdap:
-            (rec.rdap_registrar, rec.rdap_created, rec.rdap_expires,
-             rec.domain_age_days, rec.rdap_status, raw["rdap"]) = get_rdap(domain)
-            # WHOIS fallback for registries without public RDAP (e.g. .ch/SWITCH).
-            if rec.rdap_registrar == "N/A" and not args.no_whois:
-                w_reg, w_created, w_status, w_src, w_raw = whois_fallback(domain)
-                if w_reg != "N/A":
-                    rec.rdap_registrar = f"{w_reg} (whois)"
-                if w_created != "N/A":
-                    rec.rdap_created = w_created
-                    try:
-                        from datetime import datetime, timezone
-                        dt = datetime.fromisoformat(w_created)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        rec.domain_age_days = str((datetime.now(timezone.utc) - dt).days)
-                    except Exception:
-                        pass
-                if w_status != "N/A" and rec.rdap_status == "N/A":
-                    rec.rdap_status = w_status
-                raw["whois"] = {"source": w_src, **w_raw}
+            reg_info = lookup_registration(registrable_domain(domain), use_whois=not args.no_whois)
+            rec.rdap_registrar, rec.rdap_created = reg_info["registrar"], reg_info["created"]
+            rec.rdap_expires, rec.domain_age_days = reg_info["expires"], reg_info["age_days"]
+            rec.rdap_status, rec.rdap_result = reg_info["status"], reg_info["result"]
+            raw["rdap"] = reg_info["raw"]
+            if reg_info.get("whois_raw"):
+                raw["whois"] = reg_info["whois_raw"]
 
         has_addr = rec.ip != "N/A" or rec.ipv6 != "N/A"
         if not args.no_tls and has_addr:
@@ -3218,11 +3463,21 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
         rec.dangling_status, rec.dangling_detail, rec.dangling_class = detect_dangling(
             domain, dns_bits["chain"], dns_bits["ns"], dns_bits["has_resolution"],
             rec.dns_status, dns_bits["zone_ns"])
-        rec.takeover_risk, rec.takeover_detail = detect_takeover(dns_bits["chain"], body)
-        tk = assess_takeover(domain, dns_bits["chain"], rec.takeover_risk, rec.takeover_detail)
-        (rec.takeover_target_missing, rec.takeover_recreatable, rec.takeover_binding_protected,
+        ns_ev = delegation_evidence(domain, dns_bits["ns"], dns_bits["zone"], dns_bits["zone_ns"],
+                                    dns_bits["has_resolution"], rec.dns_status,
+                                    use_whois=not args.no_whois) if not args.no_rdap else {}
+        if ns_ev:
+            rec.ns_parent = ",".join(ns_ev["parent"]) or "None"
+            rec.ns_own = ",".join(ns_ev["own"]) or "None"
+            rec.ns_resolution = ";".join(f"{n}={a}" for n, a in ns_ev["addresses"].items())
+            rec.ns_registration = ";".join(f"{r}={v}" for r, v in sorted(ns_ev["registration"].items())) or "N/A"
+        obs_risk, obs_detail = detect_takeover(dns_bits["chain"], body)
+        tk = assess_takeover(domain, dns_bits["chain"], obs_risk, obs_detail, ns_ev)
+        (rec.takeover_risk, rec.takeover_detail, rec.takeover_outcome, rec.takeover_evidence,
+         rec.takeover_target_missing, rec.takeover_recreatable, rec.takeover_binding_protected,
          rec.takeover_confidence, rec.takeover_claim_verified) = (
-            tk["target_missing"], tk["recreatable"], tk["binding"], tk["confidence"], tk["verified"])
+            tk["risk"], tk["detail"], tk["outcome"], tk["evidence"], tk["target_missing"],
+            tk["recreatable"], tk["binding"], tk["confidence"], tk["verified"])
 
         if args.cors and (rec.https_status != "0" or rec.http_status != "0") and rec.is_forwarded != "Yes":
             scheme = "https" if rec.https_status != "0" else "http"
@@ -3275,6 +3530,8 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
         if INGEST is None:
             rec.scanner_findings = "not_run"
 
+        if rec.domain in OVERRIDES:
+            apply_overrides(rec, OVERRIDES[rec.domain])
         rec.dirty_forwarding = "Yes" if (rec.is_forwarded == "Yes"
                                          and rec.tls_health != "Healthy") else "No"
         rec.platform_risk = assess_platforms(
@@ -3947,6 +4204,54 @@ def post_process(results_path: str, baseline: Optional[str], report_html: Option
 
 
 
+# Fields an override may never set: identity and provenance of the record.
+OVERRIDE_PROTECTED = {"domain", "checks", "scanned_at", "clipeus_version", "rules_version", "overrides"}
+OVERRIDES: Dict[str, List[Dict[str, Any]]] = {}
+
+
+def load_overrides(path: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Manual findings to merge into records: {"overrides": [{"host", "set": {field: value},
+    "evidence", "observed_at", "analyst"}]}. Every entry must say what was observed and
+    when; an override without evidence is refused rather than silently applied."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    items = data.get("overrides", []) if isinstance(data, dict) else data
+    fields = {k for k, v in AuditRecord.__dataclass_fields__.items()}
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for i, it in enumerate(items if isinstance(items, list) else []):
+        where = f"override #{i + 1}"
+        if not isinstance(it, dict):
+            raise ValueError(f"{where}: not an object")
+        host = normalize_host(str(it.get("host", "")))
+        if not host:
+            raise ValueError(f"{where}: missing or invalid host")
+        for key in ("evidence", "observed_at"):
+            if not str(it.get(key, "")).strip():
+                raise ValueError(f"{where} ({host}): '{key}' is required")
+        sets = it.get("set")
+        if not isinstance(sets, dict) or not sets:
+            raise ValueError(f"{where} ({host}): 'set' must name at least one field")
+        for k in sets:
+            if k not in fields or k in OVERRIDE_PROTECTED:
+                raise ValueError(f"{where} ({host}): field '{k}' cannot be overridden")
+        out.setdefault(host, []).append(
+            {"set": {k: str(v) for k, v in sets.items()}, "evidence": str(it["evidence"]).strip(),
+             "observed_at": str(it["observed_at"]).strip(), "analyst": str(it.get("analyst", "")).strip()})
+    return out
+
+
+def apply_overrides(rec: AuditRecord, items: List[Dict[str, Any]]) -> None:
+    notes = []
+    for it in items:
+        for k, v in it["set"].items():
+            cur = getattr(rec, k)
+            setattr(rec, k, int(v) if isinstance(cur, int) and v.lstrip("-").isdigit() else v)
+        who = f", {it['analyst']}" if it["analyst"] else ""
+        notes.append(f"{','.join(f'{k}={v}' for k, v in it['set'].items())} "
+                     f"({it['observed_at']}{who}; {it['evidence']})")
+    rec.overrides = " | ".join(notes)
+
+
 class RunStats:
     """Counts with explicit units, so a total is never ambiguous: hostnames, distinct IPs,
     distinct certificates, distinct sites (same content behind many names)."""
@@ -3984,7 +4289,9 @@ def _sha256_file(path: Optional[str]) -> str:
 
 
 def write_manifest(output: str, args: argparse.Namespace, config_path: Optional[str],
-                   started: str, finished: str, domains: List[str], stats: "RunStats") -> str:
+                   started: str, finished: str, domains: List[str], stats: "RunStats",
+                   inventory: Optional[Dict[str, Any]] = None,
+                   run: Optional[Dict[str, int]] = None) -> str:
     """<output>.manifest.json: what produced this file, so a report built from it can be
     reproduced. Holds hashes and counts, never the configuration's content."""
     tuning_src = _TUNING.get("_source")
@@ -4000,7 +4307,13 @@ def write_manifest(output: str, args: argparse.Namespace, config_path: Optional[
         "output": os.path.basename(output),
         "input": {"path": os.path.basename(args.input) if args.input != "-" else "-",
                   "sha256": _sha256_file(args.input if args.input != "-" else None),
-                  "hosts": len(domains)},
+                  "hosts": len(domains),
+                  "inventory": {k: v for k, v in (inventory or {}).items() if k != "excluded"},
+                  "excluded_file": (os.path.basename(output) + ".excluded.txt"
+                                    if inventory and inventory.get("excluded") else "N/A")},
+        "run": run or {},
+        "overrides": {"sha256": _sha256_file(getattr(args, "overrides", None)),
+                      "hosts": len(OVERRIDES)},
         "config": {"sha256": _sha256_file(config_path), "roots": len(args.roots),
                    "managed_providers": len(args.managed_providers),
                    "approved_mx": len(args.approved_mx), "approved_redirect": len(args.approved_redirect)},
@@ -4591,18 +4904,49 @@ def selftest() -> int:
               "takeover: a live Azure app's 404 is not a takeover (S03)")
         risk, det = detect_takeover(["gone.azurewebsites.net"], "")
         tk = assess_takeover("open.example.com", ["gone.azurewebsites.net"], risk, det)
-        check(risk == "Yes" and tk["target_missing"] == "Yes" and tk["binding"] == "No"
-              and tk["recreatable"] == "unknown" and tk["confidence"] == "Medium" and tk["verified"] == "No (manual)",
-              "takeover: missing Azure app, no asuid record = Medium, unverified (S04)")
+        check(tk["risk"] == "Possibly" and tk["outcome"] == "potentially-reclaimable" and tk["binding"] == "No"
+              and tk["recreatable"] == "unknown" and tk["verified"] == "No (manual)"
+              and "claimable" not in tk["detail"].replace("reclaimable", ""),
+              "takeover: missing Azure app, no asuid, reuse unknown = potentially reclaimable, never 'claimable'")
         tk = assess_takeover("protected.example.com", ["gone.azurewebsites.net"], risk, det)
-        check(tk["binding"] == "Yes" and tk["confidence"] == "Low", "takeover: asuid verification record lowers confidence")
+        check(tk["risk"] == "No" and tk["outcome"] == "protected" and tk["binding"] == "Yes",
+              "takeover: an asuid verification record makes a missing app 'protected', not a takeover")
+        uq = "app-abcdefgh12345678.eastus-01.azurewebsites.net"
+        globals()["_target_claimable_nxdomain"] = lambda t: True
+        risk_u, det_u = detect_takeover([uq], "")
+        check(assess_takeover("u.example.com", [uq], risk_u, det_u)["outcome"] == "dangling-reserved",
+              "takeover: a unique default hostname cannot be recreated (dangling, reserved)")
+        globals()["_target_claimable_nxdomain"] = lambda t: t.startswith("gone")
         risk, det = detect_takeover(["gone.eastus.cloudapp.azure.com"], "")
-        check(assess_takeover("x.example.com", ["gone.eastus.cloudapp.azure.com"], risk, det)["confidence"] == "High",
-              "takeover: released cloudapp label with no target = High")
-        check(detect_takeover(["x.github.io"], "<title>404</title>")[0] == "Possibly",
-              "takeover: generic 404 body is an observation only")
-        check(detect_takeover(["x.github.io"], "There isn't a GitHub Pages site here.")[0] == "Yes",
-              "takeover: provider-specific unclaimed page is still Yes")
+        tk = assess_takeover("x.example.com", ["gone.eastus.cloudapp.azure.com"], risk, det)
+        check(tk["risk"] == "Yes" and tk["outcome"] == "claimable-by-policy" and tk["confidence"] == "High"
+              and tk["recreatable"] == "released (provider policy)" and tk["detail"].endswith("claim not verified"),
+              "takeover: released cloudapp label = claimable by policy, says it is unverified")
+        risk, det = detect_takeover(["x.github.io"], "<title>404</title>")
+        check(risk == "Possibly" and assess_takeover("g.example.com", ["x.github.io"], risk, det)["outcome"]
+              == "provider-binding-review", "takeover: generic 404 body is an observation only")
+        risk, det = detect_takeover(["x.cloudfront.net"], "<html>ok</html>")
+        tk = assess_takeover("c.example.com", ["x.cloudfront.net"], risk, det)
+        check(tk["risk"] == "No" and tk["outcome"] == "provider-binding-review",
+              "takeover: provider association alone is a binding review, not a finding")
+        elb = "gone-lb-123.us-east-1.elb.amazonaws.com"
+        risk, det = detect_takeover([elb], "")
+        check(assess_takeover("e.example.com", [elb], risk, det)["outcome"] == "dangling-reserved",
+              "takeover: a deleted load balancer's random name cannot be reissued (dangling, reserved)")
+        risk, det = detect_takeover(["x.github.io"], "There isn't a GitHub Pages site here.")
+        tk = assess_takeover("g.example.com", ["x.github.io"], risk, det)
+        check(tk["risk"] == "Yes" and tk["outcome"] == "claimable-by-signature",
+              "takeover: provider-specific unclaimed page = claimable by signature")
+        ns_ev = {"parent": ("ns-1.exampel.test", "ns-2.example.test"), "own": (),
+                 "addresses": {"ns-1.exampel.test": "NXDOMAIN", "ns-2.example.test": "NXDOMAIN"},
+                 "registration": {"exampel.test": "not-registered", "example.test": "ok"}}
+        tk = assess_takeover("d.example.org", [], "No", "N/A", ns_ev)
+        check(tk["risk"] == "Yes" and tk["outcome"] == "claimable-ns-domain" and tk["confidence"] == "High"
+              and "exampel.test not registered" in tk["detail"],
+              "takeover: a delegation to a nameserver whose domain is unregistered is claimable")
+        ns_ev["registration"]["exampel.test"] = "rate-limited"
+        check(assess_takeover("d.example.org", [], "No", "N/A", ns_ev)["outcome"] == "none",
+              "takeover: a failed registration lookup is never read as 'not registered'")
         # S05: names that do not exist, or exist without addresses, are not dangling.
         check(detect_dangling("a.example.com", [], [], False, "NXDOMAIN") == ("No", "Name does not exist", "nxdomain"),
               "dangling: NXDOMAIN under a delegated zone is not dangling")
@@ -4665,6 +5009,54 @@ def selftest() -> int:
         check(m["clipeus_version"] == __version__ and m["counts"]["hostnames"] == 3 and m["input"]["hosts"] == 1,
               "manifest: version, inputs and unit-labelled counts (S14)")
 
+    check(normalize_host("xn--  -1dac2z.example") is None and normalize_host("a b.example.com") is None
+          and normalize_host("_dmarc.example.com") == "_dmarc.example.com",
+          "normalize: hostnames with spaces are rejected, service labels kept")
+    with tempfile.TemporaryDirectory() as td:
+        ip = os.path.join(td, "in.txt")
+        with open(ip, "w", encoding="utf-8") as fh:
+            fh.write("# list\nexample.com\nEXAMPLE.com\n\nbad host.example\nwww.example.com\n")
+        inv: Dict[str, Any] = {}
+        hosts = read_inputs(ip, inventory=inv)
+        check(hosts == ["example.com", "www.example.com"] and inv["lines"] == 6 and inv["blank_or_comment"] == 2
+              and inv["duplicates"] == 1 and inv["invalid"] == 1 and len(inv["excluded"]) == 2,
+              "inventory: every input line is accounted for")
+        op = os.path.join(td, "ov.json")
+        with open(op, "w") as fh:
+            json.dump({"overrides": [{"host": "Example.com", "set": {"takeover_outcome": "verified",
+                       "takeover_claim_verified": "Yes"}, "evidence": "test", "observed_at": "2026-01-01",
+                       "analyst": "selftest"}]}, fh)
+        ov = load_overrides(op)
+        orc = AuditRecord(domain="example.com")
+        apply_overrides(orc, ov["example.com"])
+        check(orc.takeover_outcome == "verified" and "2026-01-01, selftest; test" in orc.overrides,
+              "overrides: applied with date, analyst and evidence")
+        with open(op, "w") as fh:
+            json.dump([{"host": "example.com", "set": {"risk_score": "0"}, "observed_at": "2026-01-01"}], fh)
+        try:
+            load_overrides(op)
+            check(False, "overrides: entry without evidence is refused")
+        except ValueError:
+            check(True, "overrides: entry without evidence is refused")
+    _saved_get = requests.get
+    try:
+        class _R:
+            def __init__(self, code, hist): self.status_code, self.history, self.headers = code, hist, {}
+        _saved_boot = globals()["_RDAP_BOOTSTRAP"]
+        globals()["_RDAP_BOOTSTRAP"] = {"example": "https://rdap.invalid/"}
+        requests.get = lambda *a, **k: _R(404, [])
+        check(_rdap_query("free.example")["result"] == "not-registered", "rdap: registry 404 = not registered")
+        check(_rdap_query("x.test")["result"] == "unsupported-tld", "rdap: TLD not in the IANA bootstrap = no RDAP")
+        check(_rdap_query("a.private.example")["result"] == "not-found(tld-registry)",
+              "rdap: a TLD registry's 404 for a name under a private suffix is not 'not registered'")
+        globals()["RDAP_BACKOFF"] = (0.0,)
+        requests.get = lambda *a, **k: _R(429, [])
+        check(_rdap_query("y.example")["result"] == "rate-limited", "rdap: rate limiting is recorded, not 'error'")
+    finally:
+        requests.get = _saved_get
+        globals()["RDAP_BACKOFF"] = (2.0, 5.0)
+        globals()["_RDAP_BOOTSTRAP"] = _saved_boot
+
     print(f"selftest: {'ALL PASS' if ok else 'FAILURES'}", file=sys.stderr)
     return 0 if ok else 1
 
@@ -4688,13 +5080,30 @@ def load_networks(path: Optional[str], configured: Optional[List[str]] = None) -
     return nets
 
 
-def read_inputs(source: str, dedup_www: bool = False) -> List[str]:
-    fh = sys.stdin if source in ("-", None) else open(source)
+def read_inputs(source: str, dedup_www: bool = False,
+                inventory: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Hosts from the input, normalised and de-duplicated. With `inventory`, also account
+    for every line: counts per outcome, plus the excluded lines with their reason, so the
+    number of hosts scanned can be reconciled with the number of lines supplied."""
+    fh = sys.stdin if source in ("-", None) else open(source, encoding="utf-8", errors="replace")
     seen, hosts = set(), []
+    inv = {"lines": 0, "blank_or_comment": 0, "invalid": 0, "duplicates": 0, "www_dropped": 0,
+           "hosts": 0, "excluded": []}
     try:
-        for line in fh:
+        for n, line in enumerate(fh, 1):
+            inv["lines"] += 1
+            text = line.strip()
+            if not text or text.startswith("#"):
+                inv["blank_or_comment"] += 1
+                continue
             h = normalize_host(line)
-            if h and h not in seen:
+            if not h:
+                inv["invalid"] += 1
+                inv["excluded"].append((n, "invalid-hostname", text))
+            elif h in seen:
+                inv["duplicates"] += 1
+                inv["excluded"].append((n, f"duplicate-of:{h}", text))
+            else:
                 seen.add(h)
                 hosts.append(h)
     finally:
@@ -4702,7 +5111,12 @@ def read_inputs(source: str, dedup_www: bool = False) -> List[str]:
             fh.close()
     if dedup_www:
         # drop www.X when X is already in the set (redundant with the apex scan)
-        hosts = [h for h in hosts if not (h.startswith("www.") and h[4:] in seen)]
+        kept = [h for h in hosts if not (h.startswith("www.") and h[4:] in seen)]
+        inv["www_dropped"] = len(hosts) - len(kept)
+        hosts = kept
+    inv["hosts"] = len(hosts)
+    if inventory is not None:
+        inventory.update(inv)
     return hosts
 
 
@@ -5129,6 +5543,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--roots", metavar="FILE",
                    help="Portfolio roots, one per line: sets root_domain / is_subdomain "
                         "(default: config roots, else each host's registrable domain)")
+    p.add_argument("--overrides", metavar="FILE",
+                   help="Manual findings (JSON) merged into matching records, each with evidence, "
+                        "observation date and analyst; recorded in the overrides column")
     p.add_argument("--no-manifest", action="store_true",
                    help="Don't write <output>.manifest.json (run provenance: version, rules, inputs, counts)")
     p.add_argument("--harvest", action="store_true",
@@ -5442,7 +5859,17 @@ def main() -> None:
             log_fh.close()
         return
 
-    domains = read_inputs(args.input, dedup_www=args.dedup_www_input)
+    inventory: Dict[str, Any] = {}
+    domains = read_inputs(args.input, dedup_www=args.dedup_www_input, inventory=inventory)
+    if inventory["excluded"]:
+        log(f"[*] input: {inventory['lines']} lines -> {inventory['hosts']} hosts "
+            f"({inventory['invalid']} invalid, {inventory['duplicates']} duplicates excluded)")
+    if args.overrides:
+        try:
+            OVERRIDES.update(load_overrides(args.overrides))
+        except (OSError, ValueError) as exc:
+            sys.exit(f"error: --overrides {args.overrides}: {exc}")
+        log(f"[*] overrides: {sum(len(v) for v in OVERRIDES.values())} entries for {len(OVERRIDES)} hosts")
     log(f"[*] Clipeus v{__version__} | loaded {len(domains)} input domains | "
         f"workers={args.workers} accurate={args.accurate} ports={args.ports}")
 
@@ -5519,7 +5946,17 @@ def main() -> None:
 
     log(f"[*] Done. {completed} records -> {args.output}")
     if args.output != "-" and not args.no_manifest:
-        mpath = write_manifest(args.output, args, brand_path, started, _utc_now(), domains, stats)
+        input_hosts = inventory.get("hosts", 0)
+        mpath = write_manifest(args.output, args, brand_path, started, _utc_now(), domains, stats,
+                               inventory=inventory,
+                               run={"input_hosts": input_hosts,
+                                    "enumerated_hosts": len(domains) - input_hosts,
+                                    "already_done": len(done), "attempted": total,
+                                    "completed": completed, "interrupted": int(STOP.is_set())})
+        if inventory.get("excluded"):
+            with open(args.output + ".excluded.txt", "w", encoding="utf-8") as fh:
+                fh.write("# line\treason\tinput\n")
+                fh.writelines(f"{n}\t{why}\t{txt}\n" for n, why, txt in inventory["excluded"])
         log(f"[*] manifest -> {mpath}")
     if (args.baseline or args.report_html) and completed:
         post_process(args.output, args.baseline, args.report_html, args.diff_out, log)

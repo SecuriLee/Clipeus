@@ -32,7 +32,7 @@
 > this tool.
 
 `clipeus.py` takes a list of domains/hosts and produces a per-domain
-security-posture report (config-issue focused, 125 columns: DNS, RDAP registration, TLS + cert detail,
+security-posture report (config-issue focused, 166 columns: DNS, RDAP registration, TLS + cert detail,
 HTTP, email auth, dangling/takeover risk, CDN, port exposure, favicon tech
 fingerprinting, optional geo/ASN) with a rolled-up risk score.
 
@@ -174,6 +174,7 @@ python3 clipeus.py --input big.txt --output big.jsonl --format jsonl \
 | `--ports-behind-cdn` | off | Port-scan even when a CDN/WAF is detected (default skips) |
 | `--no-banners` | off | Don't read service banners on open ports (banners are read by default; without them every service in `port_services` is a port guess) |
 | `--roots FILE` | config `roots` | Portfolio roots, one per line; sets `root_domain` / `is_subdomain` |
+| `--overrides FILE` | — | Manual findings merged into records, each with evidence, date and analyst |
 | `--no-manifest` | off | Don't write `<output>.manifest.json` (run provenance) |
 | `--harvest` | off | Harvest robots.txt / sitemap.xml / security.txt |
 | `--jarm` | off | Real JARM via external `jarm` tool |
@@ -234,6 +235,12 @@ and spotting off-policy domains. Each record gets:
   domain — i.e. working, non-core services worth reviewing.
 - **`.ch` (and other RDAP-less TLDs)** fall back to a raw port-43 WHOIS query
   (SWITCH `whois.nic.ch`, IANA referral for others) so registrar still resolves.
+- **Registration is looked up once per registrable domain**, from the registry's own RDAP
+  server (IANA bootstrap), with retries; subdomains reuse the result. `rdap_result` says why
+  a field is empty: `ok`, `whois`, `not-registered` (the registry answered 404),
+  `not-found(tld-registry)` (a generic TLD's registry cannot speak for a private suffix such
+  as `eu.com`), `unsupported-tld`, `rate-limited`, `timeout`, `http-NNN`, `parse-error`.
+  A failed lookup is never read as "not registered".
 
 ```bash
 # Full config audit with subdomain enumeration + a brand-TLD sweep,
@@ -392,19 +399,53 @@ hostname CNAME and a plain-text fingerprint. To pick up newer entries without ed
 download its `fingerprints.json` and pass it with `--takeover-sigs`. Entries needing a regex
 or an HTTP-status match are skipped. Body matching now HTML-unescapes first (`&#39;`).
 Elastic Beanstalk, Azure App Service (`azurewebsites.net`) and Azure CDN (`azureedge.net`)
-are in the NXDOMAIN-only class: a live app's 404 is not a takeover. Generic body signatures
-(`404`, `not found`, `bad request`, …) never produce `takeover_risk=Yes`; they are recorded
-as `Possibly` with the observation in `takeover_detail`.
+are in the NXDOMAIN-only class: a live app's 404 is not a takeover.
 
-A takeover verdict is kept apart from its evidence:
+`detect_takeover` only observes; the verdict (`takeover_risk`, `takeover_detail`) is derived
+from the evidence columns, so a protected or unverified record never says "claimable":
+
+| `takeover_outcome` | When | `takeover_risk` |
+|---|---|---|
+| `provider-binding-review` | CNAME to a provider, target still exists (no or generic signature) | `No` |
+| `protected` | target gone, but the hostname verification record exists | `No` |
+| `dangling-reserved` | target gone, but its name cannot be issued again (random load-balancer id, unique default hostname) | `No` |
+| `potentially-reclaimable` | target gone, provider's name reuse unknown, no verification record | `Possibly` |
+| `claimable-by-policy` | target gone and the provider documents that deleted names are released | `Yes` |
+| `claimable-by-signature` | the provider serves its own "no such site" page | `Yes` |
+| `claimable-ns-domain` | the name is delegated to a nameserver whose registrable domain the registry reports as not registered | `Yes` |
+| `verified` | only by an analyst, through `--overrides` | as set |
+
+Every non-verified `Yes`/`Possibly` detail ends "claim not verified". The evidence:
 
 | Column | Meaning |
 |---|---|
 | `takeover_target_missing` | `Yes` (target NXDOMAIN) / `provider-unclaimed` (provider's own "no such site" page) / `No` |
-| `takeover_recreatable` | `released` where the provider is known to release deleted names, else `unknown` (tuning `takeover_name_policy`) |
+| `takeover_recreatable` | `released (provider policy)`, `reserved (...)`, or `unknown`. Policy keys match the target, longest first (tuning `takeover_name_policy`); this is the provider's documented behaviour, not an observation |
 | `takeover_binding_protected` | `Yes` when the provider's hostname verification record exists (e.g. `asuid.<host>` for App Service), `No`, or `none-known` (tuning `takeover_binding_txt`) |
-| `takeover_confidence` | `High` (target gone, name released, no verification record) / `Medium` / `Low` |
-| `takeover_claim_verified` | always `No (manual)`: Clipeus never claims a resource |
+| `takeover_confidence` | `High` / `Medium` for findings |
+| `takeover_claim_verified` | `No (manual)` unless overridden: Clipeus never claims a resource |
+| `takeover_evidence` | the observations the outcome was derived from |
+
+Delegations are recorded from both sides where a name is a zone cut or fails to resolve:
+`ns_parent` (the parent zone's referral), `ns_own` (the zone's own NS answer),
+`ns_resolution` (each nameserver's address or `NXDOMAIN`/`NOANSWER`/`TIMEOUT`) and
+`ns_registration` (for every nameserver that does not exist, whether its registrable domain
+is registered). `ns_servers` keeps its older meaning: the NS of the closest enclosing zone.
+
+### Manual findings (`--overrides`)
+
+Findings confirmed by hand go into a JSON file, not into the report alone:
+
+```json
+{"overrides": [{"host": "app.example.com",
+                "set": {"takeover_outcome": "verified", "takeover_claim_verified": "Yes"},
+                "evidence": "registry RDAP 404 for the nameserver domain",
+                "observed_at": "2026-01-15", "analyst": "initials"}]}
+```
+
+Each entry needs `evidence` and `observed_at`; identity and provenance fields cannot be set.
+The record's `overrides` column shows what was changed, when, by whom and why, and the
+manifest records the file's hash.
 
 ## Origin discovery (`--origin`)
 
@@ -500,7 +541,9 @@ Two independent modes:
   (hash of the takeover, port and platform rules) and `root_domain` (`is_subdomain` is
   `Yes` below it). Each run writes `<output>.manifest.json`: version, rules, input and config
   hashes, flags, resolvers and counts labelled by unit (hostnames, distinct IPs,
-  certificates, sites). `endpoint_ids` and `site_id` let a report count endpoints or sites
+  certificates, sites), the input inventory (lines, blank or comment, invalid, duplicates,
+hosts) and run counts (attempted, completed, enumerated). Excluded input lines are listed
+with their reason in `<output>.excluded.txt`. `endpoint_ids` and `site_id` let a report count endpoints or sites
   instead of hostnames.
 - **Header context** — `assessed_status` is the status of the graded response; missing
   security headers are judged only on HTML (X-Frame-Options not required when CSP
