@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), ".."))
 import brand_config  # noqa: E402  (shared DNS config: one resolver setting for every tool)
+import crtsh_db      # noqa: E402  (crt.sh PostgreSQL replica: --source db)
 
 try:
     import dns.resolver
@@ -114,6 +115,11 @@ def main() -> int:
                     help="skip DNS validation; write raw union only")
     ap.add_argument("--append", action="store_true",
                     help="merge into existing --output instead of overwriting")
+    ap.add_argument("--source", choices=("web", "db"), default="web",
+                    help="web = crt.sh JSON API (rate-limited, truncates large domains); "
+                         "db = crt.sh's public PostgreSQL replica (complete, batched, one connection)")
+    ap.add_argument("--batch", type=int, default=20,
+                    help="--source db: domains per query (default 20)")
     ap.add_argument("--log", default="-")
     args = ap.parse_args()
 
@@ -126,7 +132,7 @@ def main() -> int:
         d = line.strip().lower().rstrip(".")
         if d and not d.startswith("#") and d not in seen:
             seen.add(d); roots.append(d)
-    log(f"[*] crt.sh enum over {len(roots)} domains @ {args.rate} req/s, {args.workers} workers")
+    log(f"[*] crt.sh enum over {len(roots)} domains" + (f" @ {args.rate} req/s, {args.workers} workers" if args.source == "web" else ""))
 
     raw_all: set[str] = set(roots)  # apexes belong in the audit set too
     if args.append:
@@ -136,13 +142,25 @@ def main() -> int:
             pass
 
     done = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(fetch_crtsh, d, args.rate, args.retries, log): d for d in roots}
-        for fut in as_completed(futs):
-            raw_all |= fut.result()
+    if args.source == "db":
+        log(f"[*] source: crt.sh database, batches of {args.batch}, one connection")
+        for d, names in crtsh_db.query_batches(roots, args.batch, log=log):
             done += 1
+            if names is None:
+                FAILED.append(d)
+            else:
+                raw_all |= names
+                log(f"[crtsh-db] {d}: {len(names)} names")
             if done % 100 == 0:
                 log(f"[*] {done}/{len(roots)} queried, {len(raw_all)} names so far")
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(fetch_crtsh, d, args.rate, args.retries, log): d for d in roots}
+            for fut in as_completed(futs):
+                raw_all |= fut.result()
+                done += 1
+                if done % 100 == 0:
+                    log(f"[*] {done}/{len(roots)} queried, {len(raw_all)} names so far")
 
     if FAILED:
         open(args.output + ".failed", "w").write("\n".join(sorted(FAILED)) + "\n")

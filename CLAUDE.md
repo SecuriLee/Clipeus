@@ -15,7 +15,7 @@ Clipeus is an **external attack-surface audit & subdomain-enumeration toolkit**.
 - `clipeus --show-config` — prints the effective merged configuration as JSON (use for introspection before a run).
 - Pipeline: `subfinder -dL scope.txt -silent | clipeus --input - --output - --format jsonl | jq ...`; `--emit <artifact> --emit-file -` streams one artifact type; `--ingest nuclei.jsonl --ingest httpx.json` folds external results back in.
 - Big lists: chunk via `recon/enum-bulk.sh`, don't run one giant `subfinder -dL`.
-- **Check enumeration coverage.** If `crt-failed.txt` exists in the enum output dir (or `<out>.failed` from `crtsh-enum.py`), crt.sh failed for those apexes: an empty result is a coverage gap, not "no subdomains". Re-run them (`recon/crtsh-enum.py --input crt-failed.txt ...`) before drawing conclusions. Very large apexes (thousands of certificates) are the usual casualties; a suspiciously small subdomain count for a big brand domain is the tell.
+- **Check enumeration coverage.** If `crt-failed.txt` exists in the enum output dir (or `<out>.failed` from `crtsh-enum.py`), crt.sh failed for those apexes: an empty result is a coverage gap, not "no subdomains". Re-run them (`recon/crtsh-enum.py --input crt-failed.txt ...`) before drawing conclusions. Very large apexes (thousands of certificates) are the usual casualties; a suspiciously small subdomain count for a big brand domain is the tell. When crt.sh's web API is rate-limiting or truncating, use its database instead: `enum-bulk.sh --crtsh-db`, `crtsh-enum.py --source db`, or `clipeus --ct-source db` (one connection; be gentle with the shared service).
 
 ## Configuration (policy lives OUTSIDE the code)
 Precedence, highest first: **CLI flags** → **brand/engagement config** (`--config` / `$CLIPEUS_CONFIG` / `brand.json` beside `clipeus.py` / `~/.config/clipeus/brand.json`) → **tuning file** (`$CLIPEUS_TUNING` / `clipeus.tuning.json` / `~/.config/clipeus/tuning.json`) → **in-code defaults** (always runs standalone). Examples to copy: `brand.example.json`, `clipeus.tuning.example.json`.
@@ -38,6 +38,7 @@ Single source of truth: `__version__` in `clipeus.py` (CalVer `YY.MM.patch`). Th
 ```
 clipeus.py                     entrypoint; __version__ lives here
 brand_config.py  classify.py   support modules
+crtsh_db.py                    crt.sh PostgreSQL client (--ct-source db)
 brand.example.json             example engagement policy (copy -> brand.json)
 clipeus.tuning.example.json    example operational tuning (copy -> clipeus.tuning.json)
 clipeus.platforms.json         end-of-life / non-enterprise rules behind the platform_risk column (review `_as_of` regularly)

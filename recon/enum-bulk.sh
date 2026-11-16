@@ -11,7 +11,9 @@
 # SOURCES (a mix; each is probed at startup and SKIPPED if unusable — graceful
 # fallback to "basic" with whatever is present):
 #   subfinder   aggregates ~30 passive sources, incl. crt.sh / CertSpotter CT
-#   crt.sh      dedicated Certificate-Transparency pass (survives subfinder CT throttling)
+#   crt.sh      dedicated Certificate-Transparency pass (survives subfinder CT throttling);
+#               --crtsh-db takes it from crt.sh's PostgreSQL replica instead (complete
+#               for large domains, no HTTP 429), once over all apexes after the chunks
 #   amass       passive mode, best-effort (skipped if it needs sudo / is absent)
 #   assetfinder best-effort (skipped if absent)
 #   dnsx        validates/resolves discovered names (falls back to raw-only if absent)
@@ -36,6 +38,8 @@ SUBFINDER_MAXTIME=${SUBFINDER_MAXTIME:-2}      # minutes cap inside subfinder
 CRT_TIMEOUT=${CRT_TIMEOUT:-60}                      # seconds per crt.sh request (large domains are slow)
 CRT_TRIES=${CRT_TRIES:-4}                          # attempts per apex before it is reported as failed
 CRTSH=${CRTSH:-1}                              # 1=do dedicated crt.sh pass, 0=skip
+CRTSH_DB=${CRTSH_DB:-0}                        # 1=crt.sh pass from its PostgreSQL replica
+CRTSH_DB_BATCH=${CRTSH_DB_BATCH:-20}           #   domains per database query
 USE_AMASS=${USE_AMASS:-0}                      # amass passive is slow + low-yield at
                                                # scale → opt-in via --amass only
 while [ $# -gt 0 ]; do
@@ -46,6 +50,7 @@ while [ $# -gt 0 ]; do
     --par)       PAR="$2"; shift ;;
     --resolvers) RESOLVERS_IN="$2"; shift ;;
     --no-crtsh)  CRTSH=0 ;;
+    --crtsh-db)  CRTSH_DB=1 ;;
     --amass)     USE_AMASS=1 ;;
     -h|--help)   grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -77,6 +82,17 @@ HAVE_SUBFINDER=0; have subfinder && HAVE_SUBFINDER=1
 HAVE_ASSETFINDER=0; have assetfinder && HAVE_ASSETFINDER=1
 HAVE_DNSX=0; have dnsx && HAVE_DNSX=1
 HAVE_CRTSH=0; [ "$CRTSH" = 1 ] && have curl && have jq && HAVE_CRTSH=1
+# --crtsh-db: one sequential pass over all apexes from crt.sh's PostgreSQL replica
+# after the chunks (complete results, no HTTP 429, one connection), instead of the
+# per-chunk web pass. Needs psycopg/psycopg2 or the psql client.
+HAVE_CRTSH_DB=0
+if [ "$CRTSH" = 1 ] && [ "$CRTSH_DB" = 1 ]; then
+  if python3 -c "import psycopg" 2>/dev/null || python3 -c "import psycopg2" 2>/dev/null || have psql; then
+    HAVE_CRTSH_DB=1; HAVE_CRTSH=0
+  else
+    echo "WARN: --crtsh-db needs psycopg, psycopg2 or psql; falling back to the web pass" >&2
+  fi
+fi
 # amass: opt-in (slow + low-yield at scale). The Kali /usr/bin/amass is a wrapper
 # that sudo-downloads libpostal on every run; call the REAL binary to skip that —
 # no sudoers change needed.
@@ -90,8 +106,8 @@ if [ "$USE_AMASS" = 1 ]; then
   done
 fi
 
-SRC_SUMMARY="subfinder=$HAVE_SUBFINDER crt.sh=$HAVE_CRTSH amass=$HAVE_AMASS assetfinder=$HAVE_ASSETFINDER | resolve: dnsx=$HAVE_DNSX"
-if [ $((HAVE_SUBFINDER+HAVE_CRTSH+HAVE_AMASS+HAVE_ASSETFINDER)) -eq 0 ]; then
+SRC_SUMMARY="subfinder=$HAVE_SUBFINDER crt.sh=$HAVE_CRTSH crt.sh-db=$HAVE_CRTSH_DB amass=$HAVE_AMASS assetfinder=$HAVE_ASSETFINDER | resolve: dnsx=$HAVE_DNSX"
+if [ $((HAVE_SUBFINDER+HAVE_CRTSH+HAVE_CRTSH_DB+HAVE_AMASS+HAVE_ASSETFINDER)) -eq 0 ]; then
   echo "FATAL: no usable discovery source (need at least one of subfinder/crt.sh/amass/assetfinder)" >&2
   exit 3
 fi
@@ -194,9 +210,18 @@ export SUBFINDER_TIMEOUT SUBFINDER_MAXTIME PER_CHUNK_TIMEOUT LOG OUT CRT_TIMEOUT
 find "$OUT/chunks" -maxdepth 1 -type f -name 'chunk_[0-9][0-9][0-9][0-9]' -print0 \
   | xargs -0 -P "$PAR" -I{} bash -c '_dispatch "$1"' _ {}
 
+# ---- crt.sh database pass (sequential, one connection, all apexes) -----------
+if [ "$HAVE_CRTSH_DB" = 1 ]; then
+  echo "$(date +%T) crt.sh database pass over $NAPEX apexes (batches of $CRTSH_DB_BATCH) ..." | tee -a "$LOG"
+  python3 "$(dirname "$0")/crtsh-enum.py" --source db --batch "$CRTSH_DB_BATCH" --no-resolve \
+    --input "$OUT/chunks/_apexes.txt" --output "$OUT/crt-db.txt" --log "$OUT/crt-db.log" </dev/null
+  [ -s "$OUT/crt-db.txt.failed" ] && cat "$OUT/crt-db.txt.failed" >> "$OUT/crt-failed.txt"
+  echo "$(date +%T) crt.sh database pass done | names=$(wc -l < "$OUT/crt-db.txt.all" 2>/dev/null || echo 0)" | tee -a "$LOG"
+fi
+
 # ---- merge + single resolution pass ----------------------------------------
 # RAW = union of every source across all chunks (unbiased discovery record).
-cat "$OUT/chunks"/chunk_*.raw 2>/dev/null | sort -u > "$OUT/subdomains.txt.all"
+cat "$OUT/chunks"/chunk_*.raw "$OUT/crt-db.txt.all" 2>/dev/null | sort -u > "$OUT/subdomains.txt.all"
 NRAW=$(wc -l < "$OUT/subdomains.txt.all")
 echo "$(date +%T) RAW MERGED | raw=$NRAW" | tee -a "$LOG"
 # VALIDATED = dnsx over the whole raw set in one pass (dnsx handles large lists

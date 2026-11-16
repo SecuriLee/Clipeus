@@ -200,6 +200,8 @@ python3 clipeus.py --input big.txt --output big.jsonl --format jsonl \
 | `--no-whois` | off | Skip the port-43 WHOIS fallback (used for `.ch` etc. where RDAP is empty) |
 | `--subs-file FILE` | — | Enumerate subdomains (subfinder + crt.sh + Censys) into FILE, then audit them |
 | `--no-ct` | off | Disable crt.sh CT enumeration |
+| `--ct-source web\|db` | `web` | Where crt.sh data comes from: the JSON API, or crt.sh's public PostgreSQL replica (see below) |
+| `--ct-db-batch N` | 20 | Domains per database query with `--ct-source db` |
 | `--censys` | off (opt-in) | Enable Censys hosts-index enumeration (metered/credit-limited) |
 | `--no-censys` | — | Force Censys off even if `--censys` is given |
 | `--censys-max N` | `0` (no cap) | Stop calling Censys after N API calls in this run |
@@ -659,6 +661,18 @@ parallel. Each source is probed and skipped if absent, so it degrades gracefully
 If crt.sh fails for an apex after retries (large domains time out under load), it is listed in
 `<out>/crt-failed.txt` and the run ends with a warning; re-run those with `recon/crtsh-enum.py`.
 Tune with `CRT_TIMEOUT` (default 60 s) and `CRT_TRIES` (default 4).
+
+**crt.sh from its database (`--ct-source db`, `enum-bulk.sh --crtsh-db`, `crtsh-enum.py --source db`).**
+crt.sh's web API rate-limits (HTTP 429) and truncates large answers: a domain with
+thousands of certificates can come back with a handful of names and no error. The same
+data is served read-only over PostgreSQL (`crt.sh:5432`, user `guest`, database
+`certwatch`), which returns large domains in full. `crtsh_db.py` queries it through
+psycopg, psycopg2 or the `psql` client, whichever is installed. Domains are OR-ed into one
+query (20 by default), since the server's cost is mostly per query, and the names are
+assigned back to the most specific queried domain. It is a shared public service: the
+pass uses one connection, runs sequentially, and backs off longer when the server reports
+it is full. A batch that never succeeds is written to `<subs-file>.ct-failed` (Clipeus) or
+`crt-failed.txt` (`enum-bulk.sh`) as a coverage gap, never read as "no subdomains".
 
 ```
 ./recon/enum-bulk.sh -i apexes.txt -o out/enum        # subdomains.txt(.all)

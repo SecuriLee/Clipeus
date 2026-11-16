@@ -40,7 +40,7 @@ Source = "https://github.com/SecuriLee/Clipeus"
 version = {attr = "clipeus.__version__"}
 
 [tool.setuptools]
-py-modules = ["clipeus", "brand_config", "classify"]
+py-modules = ["clipeus", "brand_config", "classify", "crtsh_db"]
 
 [tool.setuptools.data-files]
 "share/clipeus" = ["clipeus.platforms.json"]

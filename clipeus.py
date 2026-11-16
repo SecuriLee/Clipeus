@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.3"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.4"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -74,6 +74,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import brand_config
+import crtsh_db
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -5047,6 +5048,28 @@ def selftest() -> int:
         risk, det = detect_takeover([elb], "")
         check(assess_takeover("e.example.com", [elb], risk, det)["outcome"] == "dangling-reserved",
               "takeover: a deleted load balancer's random name cannot be reissued (dangling, reserved)")
+        _drv = crtsh_db._via_driver
+        try:
+            crtsh_db._via_driver = lambda doms, t: ["*.A.Example.com", "b.a.example.com.", "x.sub.example.com",
+                                                    "sub.example.com", "other.test", "mail@example.com",
+                                                    "has space.example.com"]
+            got = crtsh_db.query_many(["example.com", "sub.example.com"])
+            check(got == {"example.com": {"a.example.com", "b.a.example.com"},
+                          "sub.example.com": {"sub.example.com", "x.sub.example.com"}},
+                  "crt.sh db: names go to the most specific queried domain; wildcards, emails, junk dropped")
+            def _boom(doms, t):
+                raise OSError("could not connect")
+            crtsh_db._via_driver = _boom
+            _sl = crtsh_db.time.sleep
+            crtsh_db.time.sleep = lambda s: None
+            try:
+                res = list(crtsh_db.query_batches(["a.example", "b.example"], batch=1))
+            finally:
+                crtsh_db.time.sleep = _sl
+            check(res == [("a.example", None), ("b.example", None)],
+                  "crt.sh db: a failed query yields None (coverage gap), never an empty result")
+        finally:
+            crtsh_db._via_driver = _drv
         spam = "<title>Slot Gacor Maxwin</title><p>Daftar TOGEL, deposit QRIS 10K</p>"
         check(detect_abuse(spam) == ["maxwin", "qris", "slot gacor", "togel"] and detect_abuse("<p>slot online</p>") == []
               and detect_abuse("<p>slotted togeler maxwins</p>") == [],
@@ -5465,10 +5488,13 @@ def enumerate_subdomains(apexes: List[str], subs_file: str, log,
                          enum_workers: int = 6, resolve_subs: bool = True,
                          sf_timeout: int = 15, sf_maxtime: int = 5,
                          sf_all: bool = False, use_subfinder: bool = True,
-                         drop_www: bool = False) -> List[str]:
+                         drop_www: bool = False, ct_source: str = "web",
+                         ct_db_batch: int = 20) -> List[str]:
     """Discover subdomains via subfinder AND certificate-transparency (crt.sh),
     merged and deduped. Writes to subs_file live (tail-friendly). `ct_tlds` sweeps
-    whole brand TLDs through CT (e.g. ['brand'] for every *.brand hostname)."""
+    whole brand TLDs through CT (e.g. ['brand'] for every *.brand hostname).
+    ct_source="db" takes per-domain CT from crt.sh's PostgreSQL replica (complete
+    for large domains, no HTTP 429): one connection, `ct_db_batch` domains a query."""
     exe = (shutil.which("subfinder") or (
         os.path.expanduser("~/go/bin/subfinder")
         if os.path.exists(os.path.expanduser("~/go/bin/subfinder")) else None)
@@ -5529,7 +5555,8 @@ def enumerate_subdomains(apexes: List[str], subs_file: str, log,
 
     # Health-gate crt.sh once so a dead server doesn't waste hours of retries.
     ct_ok = False
-    if use_ct or ct_tlds:
+    use_ct_db = use_ct and ct_source == "db"
+    if (use_ct and not use_ct_db) or ct_tlds:
         try:
             probe = requests.get("https://crt.sh/?q=example.com&output=json", timeout=20,
                                  headers={"User-Agent": f"clipeus/{__version__} (CT client)"})
@@ -5592,6 +5619,25 @@ def enumerate_subdomains(apexes: List[str], subs_file: str, log,
         if cs_ok:
             log("[certspotter] enabled" + (" (with token)" if _certspotter_token()
                 else " (keyless — set CERTSPOTTER_TOKEN for scale)"))
+
+        # crt.sh database pass: sequential batches over one connection, before the
+        # parallel per-domain sources. A failed batch is a coverage gap, written to
+        # <subs_file>.ct-failed, never read as "no subdomains".
+        if use_ct_db and regs:
+            log(f"[ct-db] crt.sh database pass over {len(regs)} domains (batches of {ct_db_batch}) ...")
+            ct_failed: List[str] = []
+            for k, (reg, names) in enumerate(crtsh_db.query_batches(regs, ct_db_batch, log=log), 1):
+                if STOP.is_set():
+                    break
+                if names is None:
+                    ct_failed.append(reg)
+                else:
+                    add(sorted(names), f"ct-db {k}/{len(regs)} {reg}")
+            if ct_failed:
+                with open(subs_file + ".ct-failed", "w") as ff:
+                    ff.write("\n".join(ct_failed) + "\n")
+                log(f"[ct-db] WARNING: crt.sh database failed for {len(ct_failed)} domains -> "
+                    f"{subs_file}.ct-failed (coverage gap; re-run them)")
 
         # Per-domain CT: crt.sh when up, CertSpotter + Censys as reliable sources.
         # Parallelized across domains (bounded) so a large list doesn't take hours;
@@ -5751,6 +5797,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "(avoids scanning www.xyz.com when xyz.com is in the source)")
     p.add_argument("--no-ct", action="store_true",
                    help="Disable crt.sh certificate-transparency enumeration")
+    p.add_argument("--ct-source", choices=("web", "db"), default="web",
+                   help="Where crt.sh data comes from: web = JSON API (rate-limited, truncates "
+                        "large domains); db = crt.sh's public PostgreSQL replica (complete, "
+                        "batched over one connection; needs psycopg, psycopg2 or psql)")
+    p.add_argument("--ct-db-batch", type=int, default=20, metavar="N",
+                   help="--ct-source db: domains per database query")
     p.add_argument("--censys", action="store_true",
                    help="Enable Censys hosts-index enumeration (opt-in: metered/credit-limited, "
                         "needs CENSYS_API_ID/SECRET or a subfinder provider key; see --censys-max)")
@@ -6002,7 +6054,7 @@ def main() -> None:
     # Subdomain enumeration pre-pass (subfinder + crt.sh CT) -> subs_file, audited too.
     if args.subs_file or args.ct_tld:
         subs_out = args.subs_file or "/tmp/clipeus_subs.txt"
-        log(f"[*] enumerating subdomains (subfinder{'' if args.no_ct else ' + crt.sh'}"
+        log(f"[*] enumerating subdomains (subfinder{'' if args.no_ct else ' + crt.sh ' + args.ct_source}"
             f"{', ct-tld=' + ','.join(args.ct_tld) if args.ct_tld else ''}) -> {subs_out}")
         subs = enumerate_subdomains(domains, subs_out, log,
                                     use_ct=not args.no_ct, ct_tlds=args.ct_tld,
@@ -6013,6 +6065,7 @@ def main() -> None:
                                     sf_timeout=args.subfinder_timeout,
                                     sf_maxtime=args.subfinder_maxtime,
                                     sf_all=args.subfinder_all,
+                                    ct_source=args.ct_source, ct_db_batch=args.ct_db_batch,
                                     use_subfinder=not args.no_subfinder,
                                     drop_www=args.drop_www)
         log(f"[*] subdomain enumeration done: +{len(subs)} subdomains")
