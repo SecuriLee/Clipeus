@@ -413,6 +413,7 @@ from the evidence columns, so a protected or unverified record never says "claim
 | `claimable-by-policy` | target gone and the provider documents that deleted names are released | `Yes` |
 | `claimable-by-signature` | the provider serves its own "no such site" page | `Yes` |
 | `claimable-ns-domain` | the name is delegated to a nameserver whose registrable domain the registry reports as not registered | `Yes` |
+| `hijack-suspected` | the page serves search spam (`content_abuse`); High when the name points at a takeover-class provider or was dangling, Medium otherwise | `Yes` |
 | `verified` | only by an analyst, through `--overrides` | as set |
 
 Every non-verified `Yes`/`Possibly` detail ends "claim not verified". The evidence:
@@ -425,6 +426,21 @@ Every non-verified `Yes`/`Possibly` detail ends "claim not verified". The eviden
 | `takeover_confidence` | `High` / `Medium` for findings |
 | `takeover_claim_verified` | `No (manual)` unless overridden: Clipeus never claims a resource |
 | `takeover_evidence` | the observations the outcome was derived from |
+
+**Dangling candidates are loaded, not only judged from DNS.** A stale record can be
+claimed between scans, and a claimed one stops dangling: the target resolves and a site
+answers. For every dangling candidate Clipeus re-resolves the name and its CNAME target
+without the cache, loads the website and its certificate when anything answers, and
+re-judges the dangling state. `dangling_web_check` records the result ("still
+unresolvable; no website", or "resolves on re-query; website served 200 '<title>'; cert
+<issuer> from <date>").
+
+**Hijacked names are recognised by their content.** A name taken over through a released
+provider resource is usually filled with search spam. `content_abuse` lists the distinct
+spam terms on the page (gambling, pharma, counterfeits; at least two whole-word terms, tuning
+`abuse_terms` adds terms and `abuse_min_terms` sets the threshold). Any hit makes the
+outcome `hijack-suspected`, whatever the provider's reuse policy says, because the name is
+already serving someone else's content. Who controls that content is not verified.
 
 Delegations are recorded from both sides where a name is a zone cut or fails to resolve:
 `ns_parent` (the parent zone's referral), `ns_own` (the zone's own NS answer),

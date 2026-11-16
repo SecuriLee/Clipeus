@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.2"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.3"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -412,6 +412,25 @@ TAKEOVER_BINDING_TXT = {
 }
 TAKEOVER_BINDING_TXT.update(_tune("takeover_binding_txt", {}))
 
+# A hijacked name is usually filled with search spam (gambling, pharma, counterfeits).
+# At least ABUSE_MIN_TERMS distinct terms on one page go to content_abuse and make
+# takeover_outcome hijack-suspected. merge=True: a tuning file can add terms, never drop one.
+ABUSE_TERMS = tuple(_tune("abuse_terms", [
+    "slot gacor", "situs slot", "slot online", "daftar slot", "slot88", "togel", "toto macau",
+    "judi online", "judi bola", "bandar togel", "maxwin", "scatter hitam", "sbobet", "rtp live",
+    "link alternatif", "deposit pulsa", "qris", "casino online", "online casino", "bonus new member",
+    "viagra", "cialis", "replica watches"], merge=True))
+ABUSE_MIN_TERMS = _tune("abuse_min_terms", 2)
+_ABUSE_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in ABUSE_TERMS) + r")(?![a-z0-9])")
+
+
+def detect_abuse(body: str) -> List[str]:
+    """Distinct search-spam terms on the page, or [] when fewer than ABUSE_MIN_TERMS."""
+    if not body:
+        return []
+    found = sorted(set(_ABUSE_RE.findall(html.unescape(body).lower())))
+    return found if len(found) >= ABUSE_MIN_TERMS else []
+
 RESOLVER = dns.resolver.Resolver()
 RESOLVER.nameservers = DNS_SERVERS
 RESOLVER.timeout = 2.5
@@ -759,6 +778,9 @@ class AuditRecord:
     rdap_result: str = "N/A"           # ok / whois / not-registered / unsupported-tld / rate-limited /
                                        # timeout / http-NNN / parse-error (per registrable domain)
     overrides: str = "None"            # manual findings merged from --overrides: field=value (date, by; evidence)
+    # --- Appended in 26.11.3. ---
+    content_abuse: str = "None"        # search-spam terms (gambling, pharma, ...) on the page: a hijack sign
+    dangling_web_check: str = "N/A"    # dangling candidates: re-resolution and website load result
 
 
 FIELDNAMES = [f.name for f in AuditRecord.__dataclass_fields__.values()]
@@ -1613,11 +1635,12 @@ def detect_takeover(chain: List[str], body: str) -> Tuple[str, str]:
 _UNIQUE_DEFAULT_HOST_RE = re.compile(r"-[a-z0-9]{16}\.[a-z0-9]+-\d{2}\.azurewebsites\.net$")
 TAKEOVER_OUTCOMES = ("none", "provider-binding-review", "protected", "dangling-reserved",
                      "potentially-reclaimable", "claimable-by-policy", "claimable-by-signature",
-                     "claimable-ns-domain", "verified")
+                     "claimable-ns-domain", "hijack-suspected", "verified")
 
 
 def assess_takeover(host: str, chain: List[str], risk: str, detail: str,
-                    ns_ev: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+                    ns_ev: Optional[Dict[str, Any]] = None, abuse: Optional[List[str]] = None,
+                    was_dangling: bool = False) -> Dict[str, str]:
     """Final takeover verdict, derived only from the evidence fields. `risk`/`detail` are
     detect_takeover's observation; the returned risk/detail replace them, so a protected
     or unverified record never carries an unconditional "claimable". Claimability is
@@ -1626,6 +1649,19 @@ def assess_takeover(host: str, chain: List[str], risk: str, detail: str,
     out = {"risk": "No", "detail": "N/A", "outcome": "none", "evidence": "N/A",
            "target_missing": "N/A", "recreatable": "N/A", "binding": "N/A",
            "confidence": "N/A", "verified": "N/A"}
+    if abuse:
+        # The name already serves someone else's spam: that is the observation, whatever
+        # the provider's reuse policy. High when it points at a takeover-class provider or
+        # the audit saw it dangling; Medium otherwise (could be a compromised own site).
+        provider = next((p for tgt in chain for p in TAKEOVER_PROVIDERS if p in tgt.lower()), "")
+        via = f" via {provider} ({chain[-1].lower()})" if provider else (f" via {chain[-1].lower()}" if chain else "")
+        out.update(outcome="hijack-suspected", risk="Yes", target_missing="No",
+                   confidence="High" if provider or was_dangling else "Medium", verified="No (manual)")
+        out["detail"] = (f"hijack-suspected: serves {','.join(abuse)}{via}"
+                         f"{'; was dangling' if was_dangling else ''}; owner of the content not verified")
+        out["evidence"] = (f"abuse_terms={'+'.join(abuse)};provider={provider or 'none'};"
+                           f"target={chain[-1].lower() if chain else 'none'};was_dangling={'Yes' if was_dangling else 'No'}")
+        return out
     if risk in ("Yes", "Possibly") and chain:
         provider = next((p for tgt in chain for p in TAKEOVER_PROVIDERS if p in tgt.lower()), "")
         target = chain[-1].lower()
@@ -2481,6 +2517,11 @@ def get_web_data(domain: str, session: requests.Session, args: argparse.Namespac
     if winner is None:
         return ""
 
+    if "charset" not in winner.headers.get("Content-Type", "").lower():
+        # requests falls back to ISO-8859-1 for text/* without a charset, which garbles
+        # UTF-8 titles; use the page's own <meta charset> or the detected encoding.
+        m = re.search(rb"<meta[^>]+charset=[\"']?([\w-]+)", winner.content[:4096], re.I)
+        winner.encoding = m.group(1).decode() if m else (winner.apparent_encoding or "utf-8")
     body = winner.text
     rec.body_truncated = "Yes" if getattr(winner, "truncated", False) else "No"
     rec.final_url = winner.url
@@ -3041,8 +3082,11 @@ def score_parts(rec: AuditRecord) -> Dict[str, Any]:
     # exposure; a stale record nobody else can claim is hygiene.
     if rec.takeover_risk == "Yes":
         verified = rec.takeover_outcome == "verified"
-        add("exposure", 45, f"Takeover ({rec.takeover_outcome}"
-            f"{'' if verified else ', claim not verified'})", confirmed=verified)
+        if rec.takeover_outcome == "hijack-suspected":
+            add("exposure", 45, f"Hijack suspected (serves {rec.content_abuse})", confirmed=False)
+        else:
+            add("exposure", 45, f"Takeover ({rec.takeover_outcome}"
+                f"{'' if verified else ', claim not verified'})", confirmed=verified)
     elif rec.takeover_risk == "Possibly":
         add("exposure", 25, f"Possible takeover ({rec.takeover_outcome})", confirmed=False)
     elif rec.dangling_class == "unresponsive-cloud-ip":
@@ -3362,6 +3406,7 @@ def _rules_version() -> str:
     material = json.dumps({"takeover": TAKEOVER_PROVIDERS, "nx": NXDOMAIN_ONLY_PROVIDERS,
                            "weak": sorted(WEAK_TAKEOVER_SIGNATURES), "names": TAKEOVER_NAME_POLICY,
                            "binding": TAKEOVER_BINDING_TXT, "ports": PORT_RISK,
+                           "abuse": [list(ABUSE_TERMS), ABUSE_MIN_TERMS],
                            "platforms": {k: v for k, v in PLATFORMS.items() if k != "_source"}},
                           sort_keys=True, default=str)
     return hashlib.sha256(material.encode()).hexdigest()[:12]
@@ -3384,6 +3429,69 @@ def _utc_now() -> str:
 # =====================================================================
 # PER-DOMAIN PIPELINE
 # =====================================================================
+
+def _fresh_addresses(name: str) -> List[str]:
+    """A and AAAA for `name` from the audit's resolvers, bypassing the shared cache,
+    and dropping its cached answers so later checks see the fresh state too."""
+    fresh = dns.resolver.Resolver(configure=False)
+    fresh.nameservers, fresh.timeout, fresh.lifetime = RESOLVER.nameservers, 2.5, 5.0
+    out: List[str] = []
+    for rtype in ("A", "AAAA"):
+        try:
+            RESOLVER.cache.flush((dns.name.from_text(name), dns.rdatatype.from_text(rtype),
+                                  dns.rdataclass.IN))
+        except Exception:
+            pass
+        try:
+            out += [str(r) for r in fresh.resolve(name, rtype)]
+        except Exception:
+            pass
+    return out
+
+
+def load_dangling_candidate(domain: str, session: requests.Session, args: argparse.Namespace,
+                            rec: AuditRecord, raw: dict, dns_bits: Dict[str, Any], body: str) -> str:
+    """Dangling candidates get the website loaded, not just the DNS judged: a record
+    can be stale for minutes or already claimed. Re-resolves the name and its CNAME
+    target uncached, loads the site (and certificate) when anything answers, re-judges
+    the dangling state, and records what was seen in dangling_web_check. Returns the body."""
+    names = [domain] + ([dns_bits["chain"][-1]] if dns_bits["chain"] else [])
+    addrs = {n: _fresh_addresses(n) for n in names}
+    resolves = bool(addrs[domain])
+    if not body:
+        body = get_web_data(domain, session, args, rec, raw)
+    served = rec.https_status != "0" or rec.http_status != "0"
+    if served and rec.cert_issuer == "N/A" and not args.no_tls:
+        tls = get_tls(domain, next(iter(addrs[domain]), None))
+        rec.tls_health, rec.tls_valid = tls["health"], tls["valid"]
+        rec.tls_handshake, rec.tls_hostname, rec.tls_trust = tls["handshake"], tls["hostname"], tls["trust"]
+        rec.tls_dates, rec.tls_protocol, rec.cert_defects = tls["dates"], tls["protocol"], tls["defects"]
+        rec.tls_min, rec.tls_max, rec.tls_cipher = tls["min"], tls["max"], tls["cipher"]
+        rec.cert_subject, rec.cert_issuer = tls["cert_subject"], tls["cert_issuer"]
+        rec.cert_not_before, rec.cert_expiry = tls["cert_not_before"], tls["cert_expiry"]
+        rec.cert_days_left, rec.cert_sha256 = tls["cert_days_left"], tls["cert_sha256"]
+        rec.cert_sans, rec.cert_key, rec.cert_sig_alg = tls["cert_sans"], tls["cert_key"], tls["cert_sig_alg"]
+        rec.cert_sct_count, rec.cert_revocation = tls["cert_sct_count"], tls["cert_revocation"]
+        if tls.get("cert_pem"):
+            raw["cert_pem"] = tls["cert_pem"]
+    if resolves and rec.ip == "N/A":
+        v4 = [a for a in addrs[domain] if ":" not in a]
+        if v4:
+            rec.ip, rec.a_records = v4[0], ",".join(v4)
+        rec.dns_status = "OK"
+    if resolves:
+        rec.dangling_status, rec.dangling_detail, rec.dangling_class = detect_dangling(
+            domain, dns_bits["chain"], dns_bits["ns"], True, "OK", dns_bits["zone_ns"])
+    state = "resolves on re-query" if resolves else "still unresolvable"
+    if served:
+        code = rec.https_status if rec.https_status != "0" else rec.http_status
+        title = rec.page_title if rec.page_title != "N/A" else "no title"
+        cert = f"; cert {rec.cert_issuer} from {rec.cert_not_before}" if rec.cert_issuer != "N/A" else ""
+        rec.dangling_web_check = f"{state}; website served {code} '{title[:80]}'{cert}"
+    else:
+        rec.dangling_web_check = f"{state}; no website"
+    return body
+
 
 def process_domain(domain: str, session: requests.Session, args: argparse.Namespace,
                    org_networks: List[Any], port_list: List[int]) -> AuditRecord:
@@ -3471,8 +3579,14 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
             rec.ns_own = ",".join(ns_ev["own"]) or "None"
             rec.ns_resolution = ";".join(f"{n}={a}" for n, a in ns_ev["addresses"].items())
             rec.ns_registration = ";".join(f"{r}={v}" for r, v in sorted(ns_ev["registration"].items())) or "N/A"
+        was_dangling = rec.dangling_status in ("Yes", "Possibly")
+        if was_dangling:
+            body = load_dangling_candidate(domain, session, args, rec, raw, dns_bits, body)
+        abuse = detect_abuse(body)
+        rec.content_abuse = ",".join(abuse) or "None"
         obs_risk, obs_detail = detect_takeover(dns_bits["chain"], body)
-        tk = assess_takeover(domain, dns_bits["chain"], obs_risk, obs_detail, ns_ev)
+        tk = assess_takeover(domain, dns_bits["chain"], obs_risk, obs_detail, ns_ev,
+                             abuse=abuse, was_dangling=was_dangling)
         (rec.takeover_risk, rec.takeover_detail, rec.takeover_outcome, rec.takeover_evidence,
          rec.takeover_target_missing, rec.takeover_recreatable, rec.takeover_binding_protected,
          rec.takeover_confidence, rec.takeover_claim_verified) = (
@@ -4933,6 +5047,18 @@ def selftest() -> int:
         risk, det = detect_takeover([elb], "")
         check(assess_takeover("e.example.com", [elb], risk, det)["outcome"] == "dangling-reserved",
               "takeover: a deleted load balancer's random name cannot be reissued (dangling, reserved)")
+        spam = "<title>Slot Gacor Maxwin</title><p>Daftar TOGEL, deposit QRIS 10K</p>"
+        check(detect_abuse(spam) == ["maxwin", "qris", "slot gacor", "togel"] and detect_abuse("<p>slot online</p>") == []
+              and detect_abuse("<p>slotted togeler maxwins</p>") == [],
+              "abuse: two distinct whole-word spam terms are needed, one is not enough")
+        tk = assess_takeover("h.example.com", ["app.azurewebsites.net"], "No", "CNAME to azurewebsites.net but target resolves",
+                             abuse=detect_abuse(spam), was_dangling=True)
+        check(tk["outcome"] == "hijack-suspected" and tk["risk"] == "Yes" and tk["confidence"] == "High"
+              and "azurewebsites.net" in tk["detail"] and "was dangling" in tk["detail"],
+              "takeover: spam served through a provider CNAME = hijack suspected, even when the target resolves")
+        tk = assess_takeover("own.example.com", [], "No", "N/A", abuse=["casino online", "viagra"])
+        check(tk["outcome"] == "hijack-suspected" and tk["confidence"] == "Medium",
+              "takeover: spam on a name with no provider CNAME = hijack suspected, Medium")
         risk, det = detect_takeover(["x.github.io"], "There isn't a GitHub Pages site here.")
         tk = assess_takeover("g.example.com", ["x.github.io"], risk, det)
         check(tk["risk"] == "Yes" and tk["outcome"] == "claimable-by-signature",
