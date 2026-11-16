@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.4"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.5"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -422,6 +422,10 @@ ABUSE_TERMS = tuple(_tune("abuse_terms", [
     "link alternatif", "deposit pulsa", "qris", "casino online", "online casino", "bonus new member",
     "viagra", "cialis", "replica watches"], merge=True))
 ABUSE_MIN_TERMS = _tune("abuse_min_terms", 2)
+# Watch mode: exposure (risk_exposure) at which a host joins the elevated tier, and how
+# long a host whose risk cleared stays watched (a fixed record can break again).
+WATCH_ELEVATED_EXPOSURE = _tune("watch_elevated_exposure", 40)
+WATCH_KEEP_DAYS = _tune("watch_keep_days", 7)
 _ABUSE_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in ABUSE_TERMS) + r")(?![a-z0-9])")
 
 
@@ -5070,6 +5074,134 @@ def selftest() -> int:
                   "crt.sh db: a failed query yields None (coverage gap), never an empty result")
         finally:
             crtsh_db._via_driver = _drv
+        import smtplib as smtplib_mod
+        import tempfile
+        import watch as _w
+        dang = {"domain": "d.example.com", "takeover_risk": "Possibly", "takeover_outcome": "potentially-reclaimable",
+                "dangling_status": "Yes", "dangling_class": "dangling-cname", "dns_status": "NXDOMAIN",
+                "http_status": "0", "https_status": "0", "cert_sha256": "N/A", "risk_exposure": 25,
+                "disposition": "dead-nohttp", "content_abuse": "None", "risk_score": 35}
+        check(_w.tier_of(dang) == "high" and _w.tier_of({"dangling_class": "unresponsive-cloud-ip"}) == "elevated"
+              and _w.tier_of({"risk_exposure": 45}) == "elevated" and _w.tier_of({"risk_exposure": 10}) is None
+              and _w.tier_of({"ns_registration": "typo.example=not-registered (rdap 404)"}) == "high"
+              and _w.tier_of({"dangling_status": "Possibly", "dangling_class": "dangling-delegation",
+                              "takeover_outcome": "none", "ns_registration": "example.com=ok"}) == "elevated"
+              and _w.tier_of({"dangling_status": "Yes", "dangling_class": "dangling-cname",
+                              "takeover_outcome": "protected"}) == "elevated"
+              and _w.tier_of({"dangling_status": "Yes", "dangling_class": "dangling-cname",
+                              "takeover_outcome": "none"}) == "high",
+              "watch: tiers come from the record's evidence (takeover/dangling high; cloud IP, exposure elevated)")
+        hij = dict(dang, takeover_risk="Yes", takeover_outcome="hijack-suspected", dns_status="OK",
+                   https_status="200", page_title="Slot site", cert_sha256="ab12", cert_issuer="CA",
+                   cert_not_before="2026-01-02", content_abuse="maxwin,togel", disposition="live",
+                   dangling_status="No", dangling_class="ok", risk_score=80)
+        kinds = {e["kind"]: e["severity"] for e in _w.compare("d.example.com", "high", _w.snapshot(dang), _w.snapshot(hij))}
+        check(all(kinds.get(k) == "critical" for k in ("takeover-risk", "abusive-content", "started-serving",
+                                                       "new-certificate")),
+              "watch: a dangling name that starts serving spam with a new certificate raises critical alerts")
+        fixed = dict(dang, takeover_risk="No", takeover_outcome="none", dangling_status="No", dangling_class="nxdomain")
+        ev = _w.compare("d.example.com", "high", _w.snapshot(dang), _w.snapshot(fixed))
+        check(ev[-1]["kind"] == "risk-cleared" and all(e["severity"] == "info" for e in ev),
+              "watch: a fixed record is reported as cleared (info), its side effects too, not as an alert")
+        p0 = dict(dang, ports="80", checks="ports=passed")
+        p1 = dict(dang, ports="", checks="ports=not_run")
+        check(not [e for e in _w.compare("p.example", "high", _w.snapshot(p0), _w.snapshot(p1)) if e["kind"] == "ports-changed"],
+              "watch: a check that did not run (ports=not_run) is not compared as a change")
+        ns0 = dict(dang, ns_registration="typo.example=not-registered (rdap 404)")
+        ns1 = dict(dang, ns_registration="typo.example=ok")
+        check(any(e["kind"] == "ns-domain-registered" and e["severity"] == "critical"
+                  for e in _w.compare("z.example", "high", _w.snapshot(ns0), _w.snapshot(ns1))),
+              "watch: an unregistered nameserver domain becoming registered is critical")
+        sent = {}
+
+        class _Resp:
+            status_code = 204
+        _req_post = requests.post
+        requests.post = lambda url, json=None, timeout=None, headers=None: sent.setdefault("hook", (url, json)) and _Resp()
+        _smtp = smtplib_mod.SMTP
+
+        class _FakeSMTP:
+            def __init__(self, timeout=None):
+                pass
+            def connect(self, host, port):
+                sent["smtp"] = (host, port)
+            def starttls(self, context=None):
+                sent["tls"] = True
+            def login(self, u, pw):
+                sent["login"] = (u, pw)
+            def send_message(self, m):
+                sent["mail"] = (m["To"], m["Subject"])
+                sent["parts"] = [p.get_content_type() for p in m.walk()]
+            def quit(self):
+                pass
+        smtplib_mod.SMTP = _FakeSMTP
+        os.environ["CLIPEUS_SELFTEST_PW"] = "pw-from-env"
+        os.environ["CLIPEUS_SELFTEST_HOOK"] = "https://hooks.example/x"
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                lp = os.path.join(td, "alerts.log")
+                evs = _w.compare("d.example.com", "high", _w.snapshot(dang), _w.snapshot(hij))
+                failed = _w.dispatch(evs, {"log": lp, "min_severity": "warning", "retry_waits": [],
+                                           "webhooks": [{"url_env": "CLIPEUS_SELFTEST_HOOK"}],
+                                           "email": {"smtp_host": "mail.example", "username": "u",
+                                                     "password_env": "CLIPEUS_SELFTEST_PW", "to": ["a@example.com"]}},
+                                     lambda m: None)
+                logged = sum(1 for _ in open(lp))
+            relay = {}
+            smtplib_mod.SMTP = lambda timeout=None: type("R", (), {
+                "connect": lambda self, h, p: relay.setdefault("addr", (h, p)),
+                "starttls": lambda self, context=None: None, "quit": lambda self: None,
+                "login": lambda self, u, pw: relay.setdefault("login", True),
+                "send_message": lambda self, m: relay.setdefault("sent", True)})()
+            _w.send_email({"smtp_host": "relay.example", "smtp_connect": "192.0.2.25", "security": "none"},
+                          ["a@example.com"], "s", "t", [])
+        finally:
+            requests.post, smtplib_mod.SMTP = _req_post, _smtp
+            os.environ.pop("CLIPEUS_SELFTEST_PW", None)
+            os.environ.pop("CLIPEUS_SELFTEST_HOOK", None)
+        check(failed == 0 and logged == len(evs) and sent["hook"][1]["events"] and sent["smtp"] == ("mail.example", 587)
+              and sent.get("tls") and sent["login"] == ("u", "pw-from-env") and sent["mail"][0] == "a@example.com"
+              and sent["parts"] == ["text/plain"] and sent["hook"][0] == "https://hooks.example/x",
+              "watch: every event logged; webhook URL and SMTP password come from the environment; "
+              "email is one plain-text part over STARTTLS")
+        bad = []
+        for cfg in ({"email": {"password": "x"}}, {"webhooks": ["https://hooks.example/x"]},
+                    {"webhooks": [{"url": "https://hooks.example/x"}]}):
+            try:
+                _w.merge_alert_config(cfg, argparse.Namespace(), "/tmp/s.json")
+            except ValueError:
+                bad.append(True)
+        check(len(bad) == 3, "watch: a password or webhook URL in the config file is refused (secrets live in env)")
+        grey = {"n": 0}
+
+        def _greylisted():
+            grey["n"] += 1
+            if grey["n"] == 1:
+                raise smtplib_mod.SMTPDataError(451, b"Temporary rejected by greylisting")
+        _w._deliver(_greylisted, [0], lambda m: None, "email")
+        check(grey["n"] == 2, "watch: a greylisted (451) email is retried, not dropped")
+        with tempfile.TemporaryDirectory() as td:
+            box = os.path.join(td, "outbox.json")
+            _sl = _w.time.sleep
+            _w.time.sleep = lambda s: None
+
+            def _down(*a, **k):
+                raise OSError("relay unreachable")
+            _se = _w.send_email
+            _w.send_email = _down
+            try:
+                cfg = {"log": os.path.join(td, "a.log"), "outbox": box, "retry_waits": [1],
+                       "email": {"smtp_host": "mail.example", "to": ["a@example.com"]}}
+                _w.dispatch(evs, cfg, lambda m: None)
+                queued = len(json.load(open(box)))
+                _w.send_email = lambda *a, **k: None
+                left = _w.flush_outbox(cfg, lambda m: None)
+            finally:
+                _w.send_email, _w.time.sleep = _se, _sl
+            check(queued == 1 and left == 0 and not os.path.exists(box),
+                  "watch: an undelivered alert waits in the outbox and is sent on the next run")
+        check(relay.get("sent") and "login" not in relay and relay.get("addr") == ("192.0.2.25", 25),
+              "watch: email without a username goes through an allow-listed relay (smtp_connect) without login")
         spam = "<title>Slot Gacor Maxwin</title><p>Daftar TOGEL, deposit QRIS 10K</p>"
         check(detect_abuse(spam) == ["maxwin", "qris", "slot gacor", "togel"] and detect_abuse("<p>slot online</p>") == []
               and detect_abuse("<p>slotted togeler maxwins</p>") == [],
@@ -5795,6 +5927,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dedup-www-input", action="store_true",
                    help="When reading --input, skip www.X if X is also present "
                         "(avoids scanning www.xyz.com when xyz.com is in the source)")
+    w = p.add_argument_group("watch mode (continuous monitoring of higher-risk hosts)")
+    w.add_argument("--watch", action="append", default=[], metavar="AUDIT.jsonl",
+                   help="Watch the high/elevated-risk hosts of this audit (repeatable; a newer "
+                        "full audit refreshes the state). Re-audits only those hosts and alerts on change")
+    w.add_argument("--watch-state", metavar="FILE",
+                   help="Watch state file (default: clipeus-watch.json beside the first --watch audit)")
+    w.add_argument("--watch-tiers", choices=("high", "elevated", "all"), default="high",
+                   help="Which tier to check this run (schedule high often, elevated less often)")
+    w.add_argument("--alert-webhook-env", action="append", default=[], metavar="VAR",
+                   help="POST alerts to the webhook URL held in environment variable VAR (repeatable)")
+    w.add_argument("--alert-email", action="append", default=[], metavar="ADDR",
+                   help="Email alerts to ADDR (repeatable; adds to config alerts.email.to)")
+    w.add_argument("--alert-email-from", metavar="ADDR", help="Sender address for alert email")
+    w.add_argument("--alert-smtp-host", metavar="HOST", help="SMTP server for alert email")
+    w.add_argument("--alert-smtp-port", type=int, metavar="N",
+                   help="SMTP port (default 587 for starttls, 465 for ssl, 25 for none)")
+    w.add_argument("--alert-smtp-security", choices=("starttls", "ssl", "none"),
+                   help="SMTP transport security (default starttls)")
+    w.add_argument("--alert-smtp-user", metavar="NAME",
+                   help="SMTP login name; the password is read from $CLIPEUS_SMTP_PASSWORD. "
+                        "Leave unset for a relay that allow-lists this host")
+    w.add_argument("--alert-log", metavar="FILE",
+                   help="Append alert events as JSONL (default: <state>.alerts.log; always written)")
+    w.add_argument("--alert-min-severity", choices=("info", "warning", "critical"),
+                   help="Lowest severity sent to webhooks/email (default warning; the log gets all)")
+    w.add_argument("--alert-test", action="store_true",
+                   help="Send one test alert through every configured sink and exit")
     p.add_argument("--no-ct", action="store_true",
                    help="Disable crt.sh certificate-transparency enumeration")
     p.add_argument("--ct-source", choices=("web", "db"), default="web",
@@ -6000,6 +6159,25 @@ def main() -> None:
     port_list = {"none": [], "top": TOP_PORTS,
                  "standard": STANDARD_PORTS, "full": FULL_PORTS}[args.ports]
     org_networks = load_networks(args.org_networks, brand_cfg.get("org_networks"))
+
+    # Watch mode: re-audit the higher-risk hosts of earlier audits, alert on change.
+    if args.watch or args.watch_state or args.alert_test:
+        import watch
+        signal.signal(signal.SIGINT, lambda *_: STOP.set())
+        wsession = build_session(args.timeout)
+
+        def audit_host(host: str) -> Optional[Dict[str, Any]]:
+            rec = process_domain(host, wsession, args, org_networks, port_list)
+            return {k: getattr(rec, k) for k in FIELDNAMES}
+        try:
+            rc = watch.run(args, brand_cfg.get("alerts", {}), log, audit_host,
+                           elevated_exposure=WATCH_ELEVATED_EXPOSURE, keep_days=WATCH_KEEP_DAYS,
+                           workers=min(args.workers, 8))
+        except (OSError, ValueError) as exc:
+            sys.exit(f"error: watch: {exc}")
+        if log_fh:
+            log_fh.close()
+        sys.exit(rc)
 
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
 

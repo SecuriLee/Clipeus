@@ -17,6 +17,9 @@ Clipeus is an **external attack-surface audit & subdomain-enumeration toolkit**.
 - Big lists: chunk via `recon/enum-bulk.sh`, don't run one giant `subfinder -dL`.
 - **Check enumeration coverage.** If `crt-failed.txt` exists in the enum output dir (or `<out>.failed` from `crtsh-enum.py`), crt.sh failed for those apexes: an empty result is a coverage gap, not "no subdomains". Re-run them (`recon/crtsh-enum.py --input crt-failed.txt ...`) before drawing conclusions. Very large apexes (thousands of certificates) are the usual casualties; a suspiciously small subdomain count for a big brand domain is the tell. When crt.sh's web API is rate-limiting or truncating, use its database instead: `enum-bulk.sh --crtsh-db`, `crtsh-enum.py --source db`, or `clipeus --ct-source db` (one connection; be gentle with the shared service).
 
+## Watch mode
+`clipeus --watch out/audit.jsonl --watch-state out/watch.json --watch-tiers high|elevated` re-audits only the higher-risk hosts and alerts on change (log always; webhook/email per config). Secrets (SMTP password, webhook URLs) come only from the environment — never write them into a config file or the repo. Use `--alert-test` to check sinks. Exit codes: 0 quiet, 4 alerts, 5 delivery problem. See README "Watch mode".
+
 ## Configuration (policy lives OUTSIDE the code)
 Precedence, highest first: **CLI flags** → **brand/engagement config** (`--config` / `$CLIPEUS_CONFIG` / `brand.json` beside `clipeus.py` / `~/.config/clipeus/brand.json`) → **tuning file** (`$CLIPEUS_TUNING` / `clipeus.tuning.json` / `~/.config/clipeus/tuning.json`) → **in-code defaults** (always runs standalone). Examples to copy: `brand.example.json`, `clipeus.tuning.example.json`.
 
@@ -39,10 +42,11 @@ Single source of truth: `__version__` in `clipeus.py` (CalVer `YY.MM.patch`). Th
 clipeus.py                     entrypoint; __version__ lives here
 brand_config.py  classify.py   support modules
 crtsh_db.py                    crt.sh PostgreSQL client (--ct-source db)
+watch.py                       watch mode: tiers, change detection, alert sinks
 brand.example.json             example engagement policy (copy -> brand.json)
 clipeus.tuning.example.json    example operational tuning (copy -> clipeus.tuning.json)
 clipeus.platforms.json         end-of-life / non-enterprise rules behind the platform_risk column (review `_as_of` regularly)
 clipeus                        venv-aware launcher
 pyproject.toml  requirements.txt
-recon/                         enum-bulk.sh + crtsh/nsec3/wildcard/posture helpers
+recon/                         enum-bulk.sh + crtsh/nsec3/wildcard/posture/dns-exists helpers
 ```

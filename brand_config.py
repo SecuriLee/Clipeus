@@ -20,6 +20,11 @@ Schema (all keys optional; see brand.example.json):
   managed_providers  hosting providers the organisation runs services with (e.g. "azure",
                      "aws", a CDN name): hosts there get managed_by=org-provider(x) instead
                      of not-verified. Network location alone never means "unmanaged".
+  alerts             watch-mode alert sinks: webhooks [{url_env, format, headers}], email
+                     {smtp_host, smtp_port, security starttls|ssl|none, smtp_connect,
+                     username, password_env, from, to, subject_prefix}, log, min_severity,
+                     retry_waits. Secrets only from the environment: the SMTP password in
+                     $CLIPEUS_SMTP_PASSWORD (or password_env), webhook URLs in url_env.
   roots              portfolio root domains; root_domain / is_subdomain use the longest
                      matching root (default: each host's registrable domain). --roots FILE wins.
 """
@@ -36,7 +41,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_RESOLVERS = ["1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4"]
 DEFAULTS: Dict[str, Any] = {"approved_mx": [], "approved_redirect": [], "brand_keywords": [],
                             "resolvers": [], "org_networks": [], "managed_providers": [], "roots": [],
-                            "nsec3": {"zone": "", "known": []}}
+                            "nsec3": {"zone": "", "known": []}, "alerts": {}}
 
 
 def candidate_paths(explicit: Optional[str] = None) -> List[str]:
@@ -105,6 +110,10 @@ def load(explicit: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[str]]
             cfg["resolvers"] = _ip_list(data["resolvers"], "resolvers")
         if "org_networks" in data:
             cfg["org_networks"] = _cidr_list(data["org_networks"], "org_networks")
+        if "alerts" in data:
+            if not isinstance(data["alerts"], dict):
+                raise ValueError("'alerts' must be an object")
+            cfg["alerts"] = data["alerts"]       # validated by watch.merge_alert_config
         nsec3 = data.get("nsec3", {})
         if not isinstance(nsec3, dict):
             raise ValueError("'nsec3' must be an object")

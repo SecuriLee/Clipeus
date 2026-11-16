@@ -701,6 +701,103 @@ other tools with `--ingest nuclei.jsonl --ingest httpx.json`.
 > Provenance (tools used, resolvers, version, timestamp) belongs in the run log —
 > **not** in the per-host records — so the raw data stays unbiased for step 3.
 
+## Watch mode (continuous monitoring of higher-risk hosts)
+
+A full audit runs rarely; a claimable record can be taken over the day after it.
+Watch mode re-audits only the hosts whose last record shows higher risk, compares each
+new record with the previous one, and alerts on significant changes. It is a short
+run for cron or a systemd timer, not a daemon.
+
+```
+# seed from the latest full audit, then check the high tier
+clipeus --watch out/audit.jsonl --watch-state out/watch.json --watch-tiers high
+# from then on (the state file remembers the hosts):
+clipeus --watch-state out/watch.json --watch-tiers high        # e.g. every 30 minutes
+clipeus --watch-state out/watch.json --watch-tiers elevated    # e.g. every 6 hours
+clipeus --watch-state out/watch.json --alert-test              # check every alert sink
+```
+Pass `--watch` again with each new full audit: a newer record replaces the stored one
+and new risky hosts are added.
+
+**Tiers** come from each record's evidence, not from a host list:
+
+| Tier | When |
+|---|---|
+| high | someone else could take the name now or already has: takeover risk or a claimable outcome, search spam on the page, an unregistered nameserver domain, or a dangling CNAME whose claimability is unknown |
+| elevated | stale but not claimable today (protected, reserved, a dead nameserver in a registered domain), a provider binding to review, a cloud IP that answers on nothing, a lame delegation, or exposure at or above `watch_elevated_exposure` (tuning, default 40) |
+
+A host whose risk clears stays in the elevated tier for `watch_keep_days` (default 7),
+so a record that is fixed and broken again is still seen.
+
+**Alerts** are raised on change, by severity:
+
+| Severity | Examples |
+|---|---|
+| critical | takeover risk rises; spam appears; a dead high-tier name starts serving; a new certificate on a high-tier name; an unregistered nameserver domain gets registered |
+| warning | CNAME, addresses, nameservers or open ports change; disposition or title changes on a high-tier host; risk score up by 20 or more |
+| info | risk cleared (and the DNS changes that come with the fix); content changes on elevated hosts; tier changes |
+
+A field whose check did not run in either record (for example ports with `--ports none`)
+is not compared, so "not looked at" never reads as "gone".
+
+**Sinks.** All configured sinks are used together. The log (`<state>.alerts.log`, one JSON
+event per line) always gets every event; webhooks and email get events at or above
+`--alert-min-severity` (default `warning`), one message per run.
+
+- **Webhook:** `--alert-webhook-env VAR` (repeatable) or `alerts.webhooks` in the config,
+  each `{"url_env": "VAR", "format": "generic|slack|teams|discord"}`. The URL is read from
+  the environment variable, never from the file.
+- **Email** (plain text), any SMTP service: `alerts.email` in the config or the flags
+  `--alert-smtp-host`, `--alert-smtp-port`, `--alert-smtp-security starttls|ssl|none`,
+  `--alert-smtp-user`, `--alert-email-from`, `--alert-email ADDR`. With a login name the
+  password is read from `$CLIPEUS_SMTP_PASSWORD` (or the variable named in
+  `password_env`); without one, mail goes through a relay that allow-lists this host.
+  `smtp_connect` dials another address (for example a VPN name) while TLS is still
+  verified against `smtp_host`.
+- A password or webhook URL written into the config file is refused.
+
+```json
+"alerts": {
+  "email": {"smtp_host": "smtp.example.com", "smtp_port": 587, "security": "starttls",
+            "username": "alerts@example.com", "from": "alerts@example.com",
+            "to": ["secops@example.com"]},
+  "webhooks": [{"url_env": "CLIPEUS_HOOK", "format": "slack"}],
+  "min_severity": "warning"
+}
+```
+
+Temporary failures (greylisting, a busy relay, webhook 429/5xx) are retried after 60 and
+180 seconds (`retry_waits`). What still fails is kept in `<state>.outbox.json` and re-sent
+at the start of the next run, marked as delayed.
+
+**Exit codes:** 0 nothing to report, 4 alerts raised, 5 a sink failed or an outbox item
+is still undelivered. Schedulers can act on them.
+
+Example systemd user timer (`~/.config/systemd/user/clipeus-watch-high.service` and `.timer`):
+
+```
+[Service]
+Type=oneshot
+ExecStart=/path/to/clipeus --watch-state /path/to/watch.json --watch-tiers high
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+### Only names that exist in DNS: `recon/dns-exists.py`
+
+Certificate-transparency enumeration returns every name ever on a certificate; most old
+ones no longer exist. `recon/dns-exists.py --input names.txt --output kept.txt
+[--dropped dropped.txt]` keeps a name when it has an address, a CNAME (with or without a
+target: dangling CNAMEs answer NXDOMAIN for their address), an NS delegation, or an
+unclear answer (SERVFAIL, timeout), and drops only a clean NXDOMAIN without a CNAME, or a
+name with no address, CNAME or NS (`--keep-empty` keeps those). Portfolio domains
+themselves should always be audited, whatever DNS says: a domain that stopped resolving
+may have lapsed and be open to registration.
+
 ## Operating modes
 
 Clipeus is built to be run two ways, and the config model serves both:
