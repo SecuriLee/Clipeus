@@ -738,12 +738,15 @@ so a record that is fixed and broken again is still seen.
 | info | risk cleared (and the DNS changes that come with the fix); content changes on elevated hosts; tier changes; a move inside the provider the name already uses |
 
 A field whose check did not run in either record (for example ports with `--ports none`)
-is not compared, so "not looked at" never reads as "gone". Further noise guards:
+is not compared, so "not looked at" never reads as "gone"; nor is the output of a check
+that failed (for example a filter answering every port). Further noise guards:
 
 - Address, nameserver and port lists are compared as sets: the same records in another order are no change.
 - A move inside the provider the name already uses is info, not a warning: the first CNAME hop is unchanged
   (traffic-manager failover, CDN rotation) or the addresses stay in the same ASN, and the name still resolves.
   A new first hop, or a direct address moving to another network, still alerts.
+- Changes on a name whose addresses are all private (RFC 1918 and similar) are info: only the
+  scanning host's own network can reach them. Takeover, spam and nameserver-registration alerts keep their severity.
 - A CNAME, address or nameserver field that comes back empty once (usually a failed lookup) keeps its last
   value; the empty value is accepted only when the next run sees it too.
 - A host that gives no result within `watch_host_timeout` seconds (tuning, default 300; slow, filtered or

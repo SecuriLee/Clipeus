@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.6"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.7"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -5189,6 +5189,13 @@ def selftest() -> int:
         ev = _w.compare("h.example", "elevated", _w.snapshot(base),
                         _w.snapshot({**base, "cname": "other.example.net"}))
         check([e["severity"] for e in ev] == ["warning"], "watch: a new first CNAME hop still alerts")
+        s_failed = _w.snapshot({**base, "ports": "21,22,23,445", "checks": "ports=failed"})
+        check("ports" not in s_failed, "watch: the output of a failed check (ports=failed) is not compared")
+        lan = {"dns_status": "OK", "cname": "N/A", "a_records": "10.0.0.5", "http_status": "0", "https_status": "0"}
+        ev = _w.compare("h.example", "high", _w.snapshot(lan),
+                        _w.snapshot({**lan, "http_status": "200", "https_status": "200", "cert_sha256": "ab"}))
+        check(ev and all(e["severity"] == "info" for e in ev),
+              "watch: a private-address host starting to answer is info (only the scanner's network sees it)")
         entry = {"snapshot": _w.snapshot(base)}
         n1 = _w.snapshot({**base, "cname": "N/A"})
         held1 = _w.hold_empty(entry, n1)

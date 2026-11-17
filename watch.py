@@ -37,6 +37,7 @@ the variable named by url_env. A password or URL in the config file is an error.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import smtplib
@@ -113,7 +114,8 @@ def tier_of(rec: Dict[str, Any], elevated_exposure: int = 40) -> Optional[str]:
 
 # Snapshot field -> the check in the record's `checks` column that produces it. A
 # field whose check did not run this time (e.g. a watch run with --ports none) is
-# left out, so "not looked at" never reads as "gone".
+# left out, so "not looked at" never reads as "gone". A check that failed is left out
+# too: its partial output (e.g. a filter answering every port) is not a result.
 FIELD_CHECK = {"ports": "ports", "cert_sha256": "tls", "cert_issuer": "tls", "cert_not_before": "tls",
                "ns_registration": "rdap"}
 
@@ -132,7 +134,24 @@ def snapshot(rec: Dict[str, Any]) -> Dict[str, Any]:
     checks = dict(p.split("=", 1) for p in str(rec.get("checks", "")).split(";") if "=" in p)
     return {k: (_norm(k, rec.get(k, "N/A")) if k in SET_FIELDS else rec.get(k, "N/A"))
             for k in SNAPSHOT_FIELDS
-            if not (k in FIELD_CHECK and checks.get(FIELD_CHECK[k]) == "not_run")}
+            if not (k in FIELD_CHECK and checks.get(FIELD_CHECK[k]) in ("not_run", "failed"))}
+
+
+_LOCAL_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8",
+    "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"))
+
+
+def private_only(snap: Dict[str, Any]) -> bool:
+    """True when every published address is private (RFC 1918, CGNAT, loopback, link-local, ULA):
+    what answers there depends on the scanning host's own network, not the Internet."""
+    addrs = [a.strip() for f in ("a_records", "ipv6") if not _empty(snap.get(f))
+             for a in str(snap.get(f)).split(",") if a.strip()]
+    try:
+        return bool(addrs) and all(any(ipaddress.ip_address(a) in n for n in _LOCAL_NETS)
+                                   for a in addrs)
+    except ValueError:
+        return False
 
 
 def hold_empty(entry: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
@@ -242,6 +261,14 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     if d >= 20:
         add("warning", "risk-increased", f"risk score +{d} ({old.get('risk_score')} -> {new.get('risk_score')})",
             "risk_score", old.get("risk_score"), new.get("risk_score"))
+    if private_only(new) and not any(e["kind"] in ("takeover-risk", "abusive-content", "ns-domain-registered")
+                                     for e in ev):
+        # Only the scanning host's own network can reach a private address; what
+        # answers there says nothing about the Internet-facing posture.
+        for e in ev:
+            if e["severity"] != "info":
+                e["severity"] = "info"
+                e["detail"] += " (private address: seen from the scanning host's network only)"
     cleared = r1 < r0 or (old.get("dangling_status") in ("Yes", "Possibly") and new.get("dangling_status") == "No")
     if cleared and not any(e["severity"] == "critical" for e in ev):
         # The record was fixed: the DNS/disposition changes are how the fix looks,
