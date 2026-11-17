@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.7"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.8"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -75,6 +75,7 @@ from urllib.parse import urljoin, urlparse
 
 import brand_config
 import crtsh_db
+import thirdparty
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -787,6 +788,16 @@ class AuditRecord:
     # --- Appended in 26.11.3. ---
     content_abuse: str = "None"        # search-spam terms (gambling, pharma, ...) on the page: a hijack sign
     dangling_web_check: str = "N/A"    # dangling candidates: re-resolution and website load result
+    # --- Appended in 26.11.8 (see thirdparty.py). ---
+    resource_hosts: str = "None"       # other hosts the page loads scripts/styles/iframes from: host(kinds)
+    resource_takeover: str = "None"    # verdict:kind:url (reason) for resources someone else could serve
+    resource_stale: str = "None"       # resources whose host is gone or answers 404, not shown claimable
+    resource_integrity: str = "N/A"    # all-sri / no-sri(n/m):hosts — third-party scripts without SRI
+    iframe_sandbox: str = "N/A"        # host=none|tokens per third-party iframe
+    csp_source_risks: str = "None"     # CSP host sources anyone can publish under (shared-tenant / public-package)
+    mx_dangling: str = "None"          # exchange=NXDOMAIN[(domain-unregistered:x)] / NOANSWER
+    dmarc_rua_risk: str = "None"       # unregistered(x) / unauthorised(x) DMARC report destinations
+    cname_domain_lapsed: str = "None"  # CNAME target whose registrable domain is not registered
 
 
 FIELDNAMES = [f.name for f in AuditRecord.__dataclass_fields__.values()]
@@ -1641,12 +1652,18 @@ def detect_takeover(chain: List[str], body: str) -> Tuple[str, str]:
 _UNIQUE_DEFAULT_HOST_RE = re.compile(r"-[a-z0-9]{16}\.[a-z0-9]+-\d{2}\.azurewebsites\.net$")
 TAKEOVER_OUTCOMES = ("none", "provider-binding-review", "protected", "dangling-reserved",
                      "potentially-reclaimable", "claimable-by-policy", "claimable-by-signature",
-                     "claimable-ns-domain", "hijack-suspected", "verified")
+                     "claimable-ns-domain", "claimable-cname-domain", "hijack-suspected", "verified")
+
+
+def name_policy(target: str) -> str:
+    """Provider reuse policy for a target name (longest matching key wins)."""
+    return TAKEOVER_NAME_POLICY.get(max((k for k in TAKEOVER_NAME_POLICY if k in target.lower()),
+                                        key=len, default=""), "unknown")
 
 
 def assess_takeover(host: str, chain: List[str], risk: str, detail: str,
                     ns_ev: Optional[Dict[str, Any]] = None, abuse: Optional[List[str]] = None,
-                    was_dangling: bool = False) -> Dict[str, str]:
+                    was_dangling: bool = False, lapsed: str = "") -> Dict[str, str]:
     """Final takeover verdict, derived only from the evidence fields. `risk`/`detail` are
     detect_takeover's observation; the returned risk/detail replace them, so a protected
     or unverified record never carries an unconditional "claimable". Claimability is
@@ -1668,7 +1685,15 @@ def assess_takeover(host: str, chain: List[str], risk: str, detail: str,
         out["evidence"] = (f"abuse_terms={'+'.join(abuse)};provider={provider or 'none'};"
                            f"target={chain[-1].lower() if chain else 'none'};was_dangling={'Yes' if was_dangling else 'No'}")
         return out
-    if risk in ("Yes", "Possibly") and chain:
+    if lapsed:
+        # The CNAME points into a domain nobody holds: whoever registers it answers for
+        # this name, at any provider. Stronger than any provider policy.
+        out.update(outcome="claimable-cname-domain", risk="Yes", target_missing="Yes",
+                   recreatable="registrable (registry: not registered)", binding="N/A",
+                   confidence="High")
+        out["detail"] = f"claimable-cname-domain: CNAME to {lapsed}"
+        out["evidence"] = f"cname_domain={lapsed};chain={'->'.join(chain)}"
+    elif risk in ("Yes", "Possibly") and chain:
         provider = next((p for tgt in chain for p in TAKEOVER_PROVIDERS if p in tgt.lower()), "")
         target = chain[-1].lower()
         if "NXDOMAIN" in detail or ("signature '" not in detail and _target_claimable_nxdomain(target)):
@@ -1679,8 +1704,7 @@ def assess_takeover(host: str, chain: List[str], risk: str, detail: str,
         else:
             out["target_missing"] = "No"
             seen = "target resolves" + (f"; generic '{detail.split(chr(39))[1]}' page" if "generic '" in detail else "")
-        policy = TAKEOVER_NAME_POLICY.get(max((k for k in TAKEOVER_NAME_POLICY if k in target),
-                                              key=len, default=""), "unknown")
+        policy = name_policy(target)
         if _UNIQUE_DEFAULT_HOST_RE.search(target):
             out["recreatable"] = "reserved (unique default hostname)"
         elif policy == "released":
@@ -3108,6 +3132,19 @@ def score_parts(rec: AuditRecord) -> Dict[str, Any]:
         add("exposure", 10, "Admin login path exposed")
     if "include_unregistered(" in rec.spf_chain_issues:
         add("exposure", 25, "SPF include of unregistered domain")
+    if rec.resource_takeover not in ("None", "", "N/A"):
+        kinds = {x.split(":")[1] for x in rec.resource_takeover.split(";") if x.count(":") >= 2}
+        sure = any(x.startswith(("claimable-domain", "claimable-by-policy", "claimable-by-signature"))
+                   for x in rec.resource_takeover.split(";"))
+        pts = 40 if "script" in kinds else 25 if "iframe" in kinds else 20
+        add("exposure", pts if sure else pts // 2,
+            f"Claimable page resource ({'+'.join(sorted(kinds))}; claim not verified)", confirmed=False)
+    if "domain-unregistered" in rec.mx_dangling:
+        add("exposure", 40, "MX in an unregistered domain (mail can be received by anyone)")
+    elif rec.mx_dangling not in ("None", "", "N/A"):
+        add("hygiene", 5, f"MX does not resolve ({rec.mx_dangling})")
+    if "unregistered(" in rec.dmarc_rua_risk:
+        add("exposure", 15, "DMARC reports go to an unregistered domain")
     if rec.cors.endswith("+credentials"):
         add("exposure", 25, f"CORS {rec.cors}")
     elif rec.cors in ("reflects-origin", "null-origin"):
@@ -3156,6 +3193,10 @@ def score_parts(rec: AuditRecord) -> Dict[str, Any]:
         add("hygiene", 5, "SPF authorises an oversized range")
     if rec.csp_issues not in ("None", "report-only"):
         add("hygiene", 3, f"Weak CSP ({rec.csp_issues})")
+    if rec.csp_source_risks not in ("None", "", "N/A") and "script-src" in rec.csp_source_risks:
+        add("hygiene", 5, "CSP allows scripts from hosts anyone can publish under")
+    if rec.resource_stale not in ("None", "", "N/A"):
+        add("hygiene", 3, "Page references resources that no longer exist")
     if rec.dkim_weak != "None":
         add("hygiene", 3, f"Weak DKIM key ({rec.dkim_weak})")
     if rec.session_cookie_no_httponly != "None":
@@ -3377,6 +3418,12 @@ def describe_checks(rec: AuditRecord, args: argparse.Namespace, port_list: List[
         st["mta_sts"] = "passed" if rec.mta_sts == "enforce" else "failed"
     st["dkim"] = ("not_run" if not args.dkim else "not_applicable" if not has_mx
                   else "failed" if rec.dkim_weak != "None" else "passed")
+    st["mx"] = ("not_run" if args.no_email_hardening else "not_applicable" if not has_mx
+                else "failed" if rec.mx_dangling not in ("None", "", "N/A") else "passed")
+    is_page = responds and "html" in rec.content_type.lower()
+    st["resources"] = ("not_run" if getattr(args, "no_resources", False) else
+                       "not_applicable" if not is_page or rec.resource_hosts.startswith("N/A") else
+                       "failed" if rec.resource_takeover not in ("None", "", "N/A") else "passed")
     st["axfr"] = ("not_run" if args.no_axfr else "not_applicable" if rec.soa_record == "N/A"
                   else "failed" if rec.axfr_vuln == "Vulnerable" else "passed")
     if not port_list:
@@ -3413,6 +3460,8 @@ def _rules_version() -> str:
                            "weak": sorted(WEAK_TAKEOVER_SIGNATURES), "names": TAKEOVER_NAME_POLICY,
                            "binding": TAKEOVER_BINDING_TXT, "ports": PORT_RISK,
                            "abuse": [list(ABUSE_TERMS), ABUSE_MIN_TERMS],
+                           "thirdparty": [thirdparty.SHARED_TENANT_SUFFIXES, thirdparty.PUBLIC_PACKAGE_HOSTS,
+                                          RESOURCES_MAX, RESOURCES_IFRAMES],
                            "platforms": {k: v for k, v in PLATFORMS.items() if k != "_source"}},
                           sort_keys=True, default=str)
     return hashlib.sha256(material.encode()).hexdigest()[:12]
@@ -3497,6 +3546,112 @@ def load_dangling_candidate(domain: str, session: requests.Session, args: argpar
     else:
         rec.dangling_web_check = f"{state}; no website"
     return body
+
+
+# =====================================================================
+# THIRD-PARTY RESOURCES, MX, DMARC destinations, lapsed CNAME domains (26.11.8)
+# =====================================================================
+
+RESOURCES_MAX = _tune("resources_max", thirdparty.RESOURCE_MAX)
+RESOURCES_IFRAMES = _tune("resources_iframes", thirdparty.IFRAME_MAX)
+
+
+def host_state(host: str) -> Tuple[str, List[str]]:
+    """(OK / NXDOMAIN / NOANSWER / FAIL, CNAME chain) for a referenced host."""
+    chain = cname_chain(host)
+    addrs, status = resolve_a_status(host)
+    if addrs:
+        return "OK", chain
+    if status == "NOANSWER":
+        return ("OK" if _resolve((chain or [host])[-1], "AAAA") else "NOANSWER"), chain
+    if status == "NXDOMAIN":
+        return "NXDOMAIN", chain
+    return "FAIL", chain
+
+
+def registration_state(reg: str, use_whois: bool = True) -> str:
+    """not-registered / registered / unknown, from the shared RDAP lookup (a failed
+    lookup is unknown, never 'not registered')."""
+    if not reg:
+        return "unknown"
+    res = str(lookup_registration(reg, use_whois=use_whois).get("result", ""))
+    if res.startswith("not-registered"):
+        return "not-registered"
+    return "registered" if res in ("ok", "whois") else "unknown"
+
+
+def provider_of(names: List[str]) -> str:
+    keys = [p for n in names for p in TAKEOVER_PROVIDERS if p in n.lower()]
+    return max(keys, key=len) if keys else ""
+
+
+def provider_signature(provider: str, body: str) -> str:
+    body_l = html.unescape(body or "").lower()
+    return next((sg for sg in TAKEOVER_PROVIDERS.get(provider, [])
+                 if sg not in WEAK_TAKEOVER_SIGNATURES and sg in body_l), "")
+
+
+_JUDGE: Dict[str, Any] = {}
+_JUDGE_LOCK = threading.Lock()
+
+
+def resource_judge(session: requests.Session, args: argparse.Namespace) -> "thirdparty.Judge":
+    """One judge (and cache) per run, shared by all workers."""
+    with _JUDGE_LOCK:
+        if "j" not in _JUDGE:
+            use_whois = not getattr(args, "no_whois", False)
+
+            def fetch(url: str):
+                r = _get(session, url, args.timeout, allow_redirects=True)
+                return None if r is None else (r.status_code, r.text)
+            _JUDGE["j"] = thirdparty.Judge(
+                resolve=host_state,
+                registration=(lambda reg: "unknown") if getattr(args, "no_rdap", False)
+                else (lambda reg: registration_state(reg, use_whois)),
+                fetch=fetch, provider_of=provider_of,
+                nx_only=lambda p: any(x in p for x in NXDOMAIN_ONLY_PROVIDERS),
+                policy=name_policy, signature=provider_signature, registrable=registrable_domain)
+        return _JUDGE["j"]
+
+
+def lapsed_cname_domain(domain: str, chain: List[str], use_whois: bool = True) -> str:
+    """'target (reg not registered)' for the first CNAME target outside the host's own
+    registrable domain whose registrable domain is unregistered; '' otherwise."""
+    own = registrable_domain(domain)
+    for tgt in chain:
+        reg = registrable_domain(tgt)
+        if reg and reg != own and registration_state(reg, use_whois) == "not-registered":
+            return f"{tgt} ({reg} not registered)"
+    return ""
+
+
+def assess_resources(domain: str, body: str, rec: AuditRecord, raw: dict,
+                     session: requests.Session, args: argparse.Namespace) -> None:
+    """Fill the resource_* / iframe_sandbox / csp_source_risks columns from the page
+    already loaded. Pages on another registrable domain (an off-site redirect) are
+    not judged here: that site is not the audited name's page."""
+    if not body or "html" not in rec.content_type.lower() or rec.final_url in ("N/A", ""):
+        return
+    page_host = (urlparse(rec.final_url).hostname or "").lower()
+    if registrable_domain(page_host) != registrable_domain(domain):
+        rec.resource_hosts = f"N/A (page on {page_host})"
+        return
+    judge = resource_judge(session, args)
+    headers = {k.lower(): v for k, v in (raw.get("winner", {}).get("headers") or {}).items()}
+
+    def fetch_doc(url: str) -> Optional[str]:
+        r = _get(session, url, args.timeout, allow_redirects=True)
+        if r is None or "html" not in r.headers.get("Content-Type", "").lower():
+            return None
+        return r.text
+    res = thirdparty.assess_page(body, rec.final_url, page_host, judge,
+                                 csp=headers.get("content-security-policy", ""),
+                                 fetch_doc=fetch_doc, registrable=registrable_domain,
+                                 provider_suffixes=tuple(k for k in TAKEOVER_PROVIDERS if "." in k),
+                                 max_resources=RESOURCES_MAX, max_iframes=RESOURCES_IFRAMES)
+    for k, v in res.items():
+        setattr(rec, k, v)
+    raw["resources"] = res
 
 
 def process_domain(domain: str, session: requests.Session, args: argparse.Namespace,
@@ -3590,9 +3745,13 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
             body = load_dangling_candidate(domain, session, args, rec, raw, dns_bits, body)
         abuse = detect_abuse(body)
         rec.content_abuse = ",".join(abuse) or "None"
+        lapsed = ""
+        if rec.dangling_class == "dangling-cname" and not args.no_rdap:
+            lapsed = lapsed_cname_domain(domain, dns_bits["chain"], use_whois=not args.no_whois)
+            rec.cname_domain_lapsed = lapsed or "None"
         obs_risk, obs_detail = detect_takeover(dns_bits["chain"], body)
         tk = assess_takeover(domain, dns_bits["chain"], obs_risk, obs_detail, ns_ev,
-                             abuse=abuse, was_dangling=was_dangling)
+                             abuse=abuse, was_dangling=was_dangling, lapsed=lapsed)
         (rec.takeover_risk, rec.takeover_detail, rec.takeover_outcome, rec.takeover_evidence,
          rec.takeover_target_missing, rec.takeover_recreatable, rec.takeover_binding_protected,
          rec.takeover_confidence, rec.takeover_claim_verified) = (
@@ -3608,6 +3767,18 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
 
         if not args.no_email_hardening:
             check_email_hardening(domain, rec, session, args.timeout, args.dkim)
+            reg_state = ((lambda r: "unknown") if args.no_rdap
+                         else (lambda r: registration_state(r, not args.no_whois)))
+            if mx_hosts(rec.mx_records):
+                rec.mx_dangling = thirdparty.assess_mx(mx_hosts(rec.mx_records), host_state,
+                                                       reg_state, registrable_domain)
+            if rec.dmarc not in ("None", "", "N/A"):
+                rec.dmarc_rua_risk = thirdparty.assess_dmarc_rua(
+                    domain, rec.dmarc.replace(" (Inherited)", ""), reg_state, registrable_domain,
+                    lambda n: _resolve(n, "TXT"))
+
+        if not args.no_resources:
+            assess_resources(domain, body, rec, raw, session, args)
 
         if args.origin and rec.cdn != "No":
             origins = discover_origin(domain, rec, raw, use_geo=args.geo and not args.no_geo)
@@ -5204,6 +5375,94 @@ def selftest() -> int:
         held2 = _w.hold_empty(entry, n2)
         check(held1 == ["cname"] and n1["cname"] == base["cname"] and held2 == [] and n2["cname"] == "N/A",
               "watch: one empty DNS answer keeps the last value; a second one in a row is accepted")
+        # ---- third-party resources (26.11.8), offline: DNS / RDAP / HTTP are fakes
+        page = ('<base href="https://www.example.com/app/">'
+                '<script src="https://cdn.vendor.example/a.js" integrity="sha384-x"></script>'
+                '<script src="//gone.lapsed-vendor.example/t.js"></script>'
+                '<script src="js/own.js"></script><script src="data:text/javascript,1"></script>'
+                '<link rel="stylesheet" href="https://media.s3.amazonaws.com/site.css">'
+                '<link rel="preload" as="script" href="https://d111.cloudfront.net/p.js">'
+                '<iframe src="https://embed.player.example/v/1"></iframe>'
+                '<iframe sandbox="allow-scripts" src="https://maps.vendor.example/"></iframe>')
+        found = thirdparty.extract_resources(page, "https://www.example.com/")
+        kinds = [(r["kind"], r["url"]) for r in found]
+        check(("script", "https://gone.lapsed-vendor.example/t.js") in kinds
+              and ("script", "https://www.example.com/app/js/own.js") in kinds
+              and ("style", "https://media.s3.amazonaws.com/site.css") in kinds
+              and ("script", "https://d111.cloudfront.net/p.js") in kinds
+              and not any(u.startswith("data:") for _, u in kinds) and len(found) == 7,
+              "resources: scripts, stylesheets, preloads and iframes are collected (base href, //, data: skipped)")
+        inj = thirdparty.extract_resources(
+            "<script>$('#box').html('<div><iframe src=\"//embed.player.example/v/2\"></iframe></div>');"
+            "var s=document.createElement('script');s.src='https://tag.vendor.example/t.js';</script>",
+            "https://www.example.com/")
+        check([(r["kind"], r["url"], r["injected"]) for r in inj] ==
+              [("iframe", "https://embed.player.example/v/2", True), ("script", "https://tag.vendor.example/t.js", True)],
+              "resources: iframes and scripts injected by inline JavaScript are collected")
+        risks = thirdparty.csp_source_risks("default-src 'self'; script-src 'self' https://*.cloudfront.net "
+                                            "cdn.jsdelivr.net 'nonce-x'; img-src *.cloudfront.net")
+        check(risks == ["script-src:https://*.cloudfront.net(shared-tenant)", "script-src:cdn.jsdelivr.net(public-package)"],
+              "resources: CSP sources anyone can publish under are flagged (shared tenant, package CDN); img-src ignored")
+        dns_fake = {"gone.lapsed-vendor.example": ("NXDOMAIN", []),
+                    "d111.cloudfront.net": ("NXDOMAIN", []),
+                    "media.s3.amazonaws.com": ("OK", []), "cdn.vendor.example": ("OK", []),
+                    "embed.player.example": ("OK", []), "maps.vendor.example": ("OK", []),
+                    "player-assets.s3.amazonaws.com": ("OK", [])}
+        fetched = []
+
+        def _fetch_fake(url):
+            fetched.append(url)
+            return (404, "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist"
+                         "</Message></Error>")
+        judge = thirdparty.Judge(
+            resolve=lambda h: dns_fake.get(h, ("OK", [])),
+            registration=lambda r: "not-registered" if r == "lapsed-vendor.example" else "registered",
+            fetch=_fetch_fake, provider_of=provider_of,
+            nx_only=lambda p: any(x in p for x in NXDOMAIN_ONLY_PROVIDERS),
+            policy=name_policy, signature=provider_signature, registrable=registrable_domain)
+        frame_doc = '<script src="https://player-assets.s3.amazonaws.com/player.js"></script>'
+        res = thirdparty.assess_page(page, "https://www.example.com/", "www.example.com", judge,
+                                     csp="script-src 'self' https://*.cloudfront.net",
+                                     fetch_doc=lambda u: frame_doc if "embed.player" in u else None,
+                                     registrable=registrable_domain)
+        tk = res["resource_takeover"]
+        check("claimable-domain:script:https://gone.lapsed-vendor.example/t.js" in tk
+              and "claimable-by-signature:style:https://media.s3.amazonaws.com/site.css" in tk
+              and "potentially-claimable:script:https://d111.cloudfront.net/p.js" in tk,
+              "resources: lapsed domain, unclaimed bucket (signature) and NXDOMAIN provider target are claimable")
+        check("claimable-by-signature:script:https://player-assets.s3.amazonaws.com/player.js via iframe "
+              "embed.player.example" in tk,
+              "resources: an iframe's own scripts are judged too (level 2)")
+        check(not any("vendor.example" in u and "lapsed" not in u for u in fetched),
+              "resources: hosts outside takeover-class providers get DNS only, no request")
+        check(res["iframe_sandbox"] == "embed.player.example=none;maps.vendor.example=allow-scripts"
+              and res["resource_integrity"].startswith("no-sri(2/3)")
+              and "(shared-tenant)" in res["csp_source_risks"],
+              "resources: iframe sandbox, third-party scripts without SRI and CSP source risks recorded")
+        mx = thirdparty.assess_mx(["mx1.example.com", "mx.lapsed-mail.example", "old.example.com"],
+                                  lambda h: {"mx.lapsed-mail.example": ("NXDOMAIN", []),
+                                             "old.example.com": ("NXDOMAIN", [])}.get(h, ("OK", [])),
+                                  lambda r: "not-registered" if r == "lapsed-mail.example" else "registered",
+                                  registrable_domain)
+        check(mx == "mx.lapsed-mail.example=NXDOMAIN(domain-unregistered:lapsed-mail.example);old.example.com=NXDOMAIN",
+              "mx: an exchange in an unregistered domain is claimable; a dead one in a registered domain is stale")
+        rua = thirdparty.assess_dmarc_rua(
+            "example.com", "v=DMARC1; p=reject; rua=mailto:d@reports.lapsed-dmarc.example,mailto:a@example.com,"
+            "mailto:x@vendor.example; ruf=mailto:f@ok.example",
+            lambda r: "not-registered" if r == "lapsed-dmarc.example" else "registered", registrable_domain,
+            lambda n: ("v=DMARC1",) if n == "example.com._report._dmarc.ok.example" else ())
+        check(rua == "unregistered(lapsed-dmarc.example);unauthorised(vendor.example)",
+              "dmarc: report destinations in unregistered domains and without authorisation are flagged")
+        tko = assess_takeover("old.example.com", ["app.lapsed-saas.example"], "No", "N/A",
+                              lapsed="app.lapsed-saas.example (lapsed-saas.example not registered)")
+        check(tko["outcome"] == "claimable-cname-domain" and tko["risk"] == "Yes",
+              "takeover: a CNAME into an unregistered domain is claimable-cname-domain")
+        check(_w.tier_of({"resource_takeover": "claimable-domain:script:https://x.example/a.js (x)"}) == "high"
+              and _w.tier_of({"mx_dangling": "mx.example.net=NXDOMAIN"}) == "elevated",
+              "watch: a claimable page resource is high tier; a dead MX is elevated")
+        ev = _w.compare("h.example", "elevated", {"resource_takeover": "None"},
+                        {"resource_takeover": "claimable-by-signature:script:https://b.s3.amazonaws.com/x.js (y)"})
+        check([e["severity"] for e in ev] == ["critical"], "watch: a page resource becoming claimable is critical")
         bad = []
         for cfg in ({"email": {"password": "x"}}, {"webhooks": ["https://hooks.example/x"]},
                     {"webhooks": [{"url": "https://hooks.example/x"}]}):
@@ -5923,6 +6182,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip the recursive SPF include-chain walk (DNS only, cached)")
     p.add_argument("--no-email-hardening", action="store_true",
                    help="Skip MTA-STS / TLS-RPT / BIMI / DANE checks (run only for domains with MX)")
+    p.add_argument("--no-resources", action="store_true",
+                   help="Skip the third-party resource check (scripts, stylesheets and iframes the "
+                        "page loads: claimable hosts, missing SRI, iframe sandbox, CSP sources). "
+                        "It sends one GET per resource at a takeover-class provider and loads "
+                        f"up to {RESOURCES_IFRAMES} iframe documents per page")
     p.add_argument("--dkim", action="store_true",
                    help="Probe common DKIM selectors and flag keys under 2048 bits "
                         f"({len(DKIM_SELECTORS)} extra DNS queries per mail domain)")

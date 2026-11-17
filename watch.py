@@ -9,10 +9,12 @@ still runs on its own schedule and can be fed back in with --watch.
 
 Tiers are derived from the evidence in each record, not from a host list:
   high      a takeover or hijack is possible or observed, the page serves search
-            spam, a nameserver's domain is unregistered, or a CNAME dangles towards
-            a target whose claimability is unknown
+            spam, a nameserver's domain is unregistered, a CNAME dangles towards
+            a target whose claimability is unknown, the page loads a script, style
+            or iframe someone else could serve, or an MX sits in an unregistered domain
   elevated  a provider binding to review, a cloud IP that answers on nothing, a lame
-            delegation, a dangling record nobody can reclaim, or exposure at or above
+            delegation, a dangling record nobody can reclaim, an MX that does not
+            resolve, DMARC reports to an unregistered domain, or exposure at or above
             the tuning value watch_elevated_exposure (default 40)
 A host whose risk clears stays in the elevated tier for watch_keep_days (default 7),
 so a record that is fixed and broken again is still watched. A host that gives no
@@ -54,7 +56,7 @@ SEVERITIES = ("info", "warning", "critical")
 _SEV = {s: i for i, s in enumerate(SEVERITIES)}
 
 HIGH_OUTCOMES = {"potentially-reclaimable", "claimable-by-policy", "claimable-by-signature",
-                 "claimable-ns-domain", "hijack-suspected", "verified"}
+                 "claimable-ns-domain", "claimable-cname-domain", "hijack-suspected", "verified"}
 ELEVATED_OUTCOMES = {"provider-binding-review", "protected", "dangling-reserved"}
 ELEVATED_CLASSES = {"unresponsive-cloud-ip", "lame-delegation"}
 
@@ -64,7 +66,8 @@ SNAPSHOT_FIELDS = ("dns_status", "cname", "a_records", "ipv6", "ns_servers", "ns
                    "http_status", "https_status", "final_url", "page_title", "body_sha256",
                    "cert_sha256", "cert_issuer", "cert_not_before", "disposition",
                    "dangling_status", "dangling_class", "takeover_risk", "takeover_outcome",
-                   "content_abuse", "ports", "risk_score", "risk_exposure", "asn", "scanned_at")
+                   "content_abuse", "ports", "risk_score", "risk_exposure", "asn",
+                   "resource_takeover", "mx_dangling", "dmarc_rua_risk", "scanned_at")
 
 # List-valued fields: compared as sets, so a resolver returning the same records in
 # another order is not a change.
@@ -89,17 +92,24 @@ def _parse(ts: str) -> Optional[datetime]:
         return None
 
 
+def _present(v: Any) -> bool:
+    return v not in (None, "", "None", "N/A") and not str(v).startswith("N/A")
+
+
 def tier_of(rec: Dict[str, Any], elevated_exposure: int = 40) -> Optional[str]:
     """'high', 'elevated' or None, from the record's own evidence.
     High means someone else could take the name now or already has: a takeover
     risk or claimable outcome, search spam on the page, an unregistered nameserver
-    domain, or a dangling CNAME whose claimability is unknown. Stale records nobody
+    domain, a dangling CNAME whose claimability is unknown, a claimable page
+    resource, or an MX in an unregistered domain. Stale records nobody
     else can claim (protected, reserved, a dead nameserver in a registered domain)
     are elevated: still watched, so a change is seen, but not as an emergency."""
     outcome = rec.get("takeover_outcome", "N/A")
     if (rec.get("takeover_risk") in ("Yes", "Possibly") or outcome in HIGH_OUTCOMES
             or rec.get("content_abuse", "None") not in ("None", "", "N/A")
             or "not-registered" in str(rec.get("ns_registration", ""))
+            or _present(rec.get("resource_takeover"))
+            or "domain-unregistered" in str(rec.get("mx_dangling", ""))
             or rec.get("dangling_class") == "dangling-cname" and outcome in ("none", "N/A", "")):
         return "high"
     try:
@@ -107,6 +117,7 @@ def tier_of(rec: Dict[str, Any], elevated_exposure: int = 40) -> Optional[str]:
     except (TypeError, ValueError):
         exposure = 0
     if (outcome in ELEVATED_OUTCOMES or rec.get("dangling_class") in ELEVATED_CLASSES
+            or _present(rec.get("mx_dangling")) or "unregistered(" in str(rec.get("dmarc_rua_risk", ""))
             or rec.get("dangling_status") in ("Yes", "Possibly") or exposure >= elevated_exposure):
         return "elevated"
     return None
@@ -117,7 +128,8 @@ def tier_of(rec: Dict[str, Any], elevated_exposure: int = 40) -> Optional[str]:
 # left out, so "not looked at" never reads as "gone". A check that failed is left out
 # too: its partial output (e.g. a filter answering every port) is not a result.
 FIELD_CHECK = {"ports": "ports", "cert_sha256": "tls", "cert_issuer": "tls", "cert_not_before": "tls",
-               "ns_registration": "rdap"}
+               "ns_registration": "rdap", "resource_takeover": "resources", "mx_dangling": "mx",
+               "dmarc_rua_risk": "mx"}
 
 
 def _empty(v: Any) -> bool:
@@ -211,6 +223,19 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     if new.get("content_abuse", "None") not in ("None", "", "N/A") and changed("content_abuse"):
         add("critical", "abusive-content", f"page serves {new.get('content_abuse')}",
             "content_abuse", old.get("content_abuse"), new.get("content_abuse"))
+    if changed("resource_takeover") and _present(new.get("resource_takeover")):
+        add("critical", "claimable-resource",
+            f"page loads a resource someone else could serve: {new.get('resource_takeover')}",
+            "resource_takeover", old.get("resource_takeover"), new.get("resource_takeover"))
+    if changed("mx_dangling") and "domain-unregistered" in str(new.get("mx_dangling", "")):
+        add("critical", "claimable-mx", f"mail exchange in an unregistered domain: {new.get('mx_dangling')}",
+            "mx_dangling", old.get("mx_dangling"), new.get("mx_dangling"))
+    elif changed("mx_dangling") and _present(new.get("mx_dangling")):
+        add("warning", "mx-dangling", f"mail exchange does not resolve: {new.get('mx_dangling')}",
+            "mx_dangling", old.get("mx_dangling"), new.get("mx_dangling"))
+    if changed("dmarc_rua_risk") and "unregistered(" in str(new.get("dmarc_rua_risk", "")):
+        add("warning", "dmarc-report-domain", f"DMARC reports go to {new.get('dmarc_rua_risk')}",
+            "dmarc_rua_risk", old.get("dmarc_rua_risk"), new.get("dmarc_rua_risk"))
     was_dead = old.get("dns_status") != "OK" or (old.get("http_status") in ("0", 0, "N/A")
                                                 and old.get("https_status") in ("0", 0, "N/A"))
     now_up = new.get("dns_status") == "OK" and (new.get("http_status") not in ("0", 0, "N/A")
@@ -261,7 +286,8 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     if d >= 20:
         add("warning", "risk-increased", f"risk score +{d} ({old.get('risk_score')} -> {new.get('risk_score')})",
             "risk_score", old.get("risk_score"), new.get("risk_score"))
-    if private_only(new) and not any(e["kind"] in ("takeover-risk", "abusive-content", "ns-domain-registered")
+    if private_only(new) and not any(e["kind"] in ("takeover-risk", "abusive-content", "ns-domain-registered",
+                                                   "claimable-resource", "claimable-mx")
                                      for e in ev):
         # Only the scanning host's own network can reach a private address; what
         # answers there says nothing about the Internet-facing posture.

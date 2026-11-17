@@ -415,6 +415,7 @@ from the evidence columns, so a protected or unverified record never says "claim
 | `claimable-by-policy` | target gone and the provider documents that deleted names are released | `Yes` |
 | `claimable-by-signature` | the provider serves its own "no such site" page | `Yes` |
 | `claimable-ns-domain` | the name is delegated to a nameserver whose registrable domain the registry reports as not registered | `Yes` |
+| `claimable-cname-domain` | a dangling CNAME points into a domain the registry reports as not registered (`cname_domain_lapsed`): whoever registers it answers for the name | `Yes` |
 | `hijack-suspected` | the page serves search spam (`content_abuse`); High when the name points at a takeover-class provider or was dangling, Medium otherwise | `Yes` |
 | `verified` | only by an analyst, through `--overrides` | as set |
 
@@ -464,6 +465,57 @@ Findings confirmed by hand go into a JSON file, not into the report alone:
 Each entry needs `evidence` and `observed_at`; identity and provenance fields cannot be set.
 The record's `overrides` column shows what was changed, when, by whom and why, and the
 manifest records the file's hash.
+
+## Third-party resources, MX and DMARC destinations
+
+A page that loads a script, stylesheet or iframe from a host that no longer exists, a
+deleted cloud bucket, or a lapsed domain hands that slot to whoever claims it first: the
+browser runs their code in the page. The page itself still looks fine, so the name-level
+takeover checks never see it. For every HTML page the audit loads (on the audited name's
+own registrable domain), Clipeus:
+
+- collects `<script src>`, stylesheet and preload `<link>`, `<iframe>`/`<frame>`, plus
+  iframes and scripts that inline JavaScript injects (markup in a string, a `.src`
+  assignment), and follows up to 5 iframe documents to collect theirs (level 2);
+- judges each referenced host once per run, from evidence (DNS, RDAP, the provider tables
+  above) and writes the claimable ones to `resource_takeover` as `verdict:kind:url (reason)`:
+
+| Verdict | When |
+|---|---|
+| `claimable-domain` | the host's registrable domain is not registered |
+| `claimable-by-policy` | the host or its CNAME target at a takeover-class provider is NXDOMAIN and the provider releases such names |
+| `claimable-by-signature` | the provider answers the exact resource URL with its "no such bucket/site" page |
+| `potentially-claimable` | a provider target is NXDOMAIN, reuse policy unknown |
+
+  Resources whose host is gone, or whose provider answers 404/410, without evidence that
+  anyone can claim them, go to `resource_stale`.
+- grades the page: `resource_integrity` (third-party scripts without Subresource
+  Integrity), `iframe_sandbox` (third-party iframes and their `sandbox` tokens, `none`
+  when absent), `csp_source_risks` (CSP host sources anyone can publish under: a wildcard
+  on a shared-tenant provider such as `*.cloudfront.net`, or a public package CDN such as
+  jsdelivr or unpkg, which serve any published package).
+
+`resource_hosts` lists the other hosts the page loads from. Requests to third parties are
+limited to what a browser would load: one GET of the exact resource URL, and only when the
+host is at a takeover-class provider (where the "unclaimed" signatures live), plus the
+iframe documents followed for level 2. No ports, TLS probes or unreferenced paths. A page
+on another registrable domain (an off-site redirect) is not judged (`N/A (page on host)`).
+`--no-resources` turns the check off; tuning `resources_max` (40 per page) and
+`resources_iframes` (5) bound it. The `resources` entry in `checks` records the state.
+
+**Mail-side records.** `mx_dangling` lists exchanges that do not resolve; one in an
+unregistered domain (`=NXDOMAIN(domain-unregistered:x)`) means anyone can register it and
+receive the mail. `dmarc_rua_risk` lists DMARC report destinations (`rua`/`ruf`) in an
+unregistered domain (`unregistered(x)`: the reports, with sending-source data, go to
+whoever registers it) and external destinations without the RFC 7489 authorisation record
+(`unauthorised(x)`: receivers drop those reports). Both need `rdap` to judge registration;
+a failed lookup is "unknown", never "unregistered".
+
+Scoring: a claimable script +40 exposure (iframe +25, stylesheet +20; half for
+`potentially-claimable`), an MX in an unregistered domain +40, DMARC reports to an
+unregistered domain +15; a CSP script source anyone can publish under +5 and stale
+resources +3 hygiene. Watch mode treats a claimable resource or MX as high tier and alerts
+`critical` when one appears.
 
 ## Origin discovery (`--origin`)
 
