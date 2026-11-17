@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.5"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.6"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
 
 import argparse
 import base64
@@ -426,6 +426,7 @@ ABUSE_MIN_TERMS = _tune("abuse_min_terms", 2)
 # long a host whose risk cleared stays watched (a fixed record can break again).
 WATCH_ELEVATED_EXPOSURE = _tune("watch_elevated_exposure", 40)
 WATCH_KEEP_DAYS = _tune("watch_keep_days", 7)
+WATCH_HOST_TIMEOUT = _tune("watch_host_timeout", 300)   # seconds per host before it is skipped
 _ABUSE_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in ABUSE_TERMS) + r")(?![a-z0-9])")
 
 
@@ -5164,6 +5165,38 @@ def selftest() -> int:
               and sent["parts"] == ["text/plain"] and sent["hook"][0] == "https://hooks.example/x",
               "watch: every event logged; webhook URL and SMTP password come from the environment; "
               "email is one plain-text part over STARTTLS")
+        def _slow(h):
+            if h == "tarpit.example":
+                time.sleep(3)
+            return {"domain": h}
+        t0 = time.monotonic()
+        res, late = _w.audit_with_deadline(["ok.example", "tarpit.example"], _slow, 2, 1)
+        check(late == ["tarpit.example"] and [h for h, _ in res] == ["ok.example"] and time.monotonic() - t0 < 2.5,
+              "watch: a host that hangs (tarpit) is skipped after the time limit; the run does not wait for it")
+        base = {"dns_status": "OK", "cname": "tm-1.trafficmanager.example -> lb-west.cloud.example",
+                "a_records": "192.0.2.1,192.0.2.2", "asn": "AS64500", "http_status": "200", "https_status": "200"}
+        ev = _w.compare("h.example", "elevated", _w.snapshot(base),
+                        _w.snapshot({**base, "a_records": "192.0.2.2,192.0.2.1"}))
+        check(ev == [], "watch: the same addresses in another order are not a change")
+        ev = _w.compare("h.example", "elevated", _w.snapshot(base),
+                        _w.snapshot({**base, "cname": "tm-1.trafficmanager.example -> lb-north.cloud.example",
+                                     "a_records": "198.51.100.7"}))
+        check(ev and all(e["severity"] == "info" for e in ev),
+              "watch: a failover behind the same first CNAME hop is info, not an alert")
+        ev = _w.compare("h.example", "elevated", _w.snapshot({**base, "cname": "N/A"}),
+                        _w.snapshot({**base, "cname": "N/A", "a_records": "203.0.113.9", "asn": "AS64511"}))
+        check([e["severity"] for e in ev] == ["warning"], "watch: a direct address moving to another network still alerts")
+        ev = _w.compare("h.example", "elevated", _w.snapshot(base),
+                        _w.snapshot({**base, "cname": "other.example.net"}))
+        check([e["severity"] for e in ev] == ["warning"], "watch: a new first CNAME hop still alerts")
+        entry = {"snapshot": _w.snapshot(base)}
+        n1 = _w.snapshot({**base, "cname": "N/A"})
+        held1 = _w.hold_empty(entry, n1)
+        entry["snapshot"] = n1
+        n2 = _w.snapshot({**base, "cname": "N/A"})
+        held2 = _w.hold_empty(entry, n2)
+        check(held1 == ["cname"] and n1["cname"] == base["cname"] and held2 == [] and n2["cname"] == "N/A",
+              "watch: one empty DNS answer keeps the last value; a second one in a row is accepted")
         bad = []
         for cfg in ({"email": {"password": "x"}}, {"webhooks": ["https://hooks.example/x"]},
                     {"webhooks": [{"url": "https://hooks.example/x"}]}):
@@ -6172,12 +6205,14 @@ def main() -> None:
         try:
             rc = watch.run(args, brand_cfg.get("alerts", {}), log, audit_host,
                            elevated_exposure=WATCH_ELEVATED_EXPOSURE, keep_days=WATCH_KEEP_DAYS,
-                           workers=min(args.workers, 8))
+                           workers=min(args.workers, 8), host_timeout=WATCH_HOST_TIMEOUT)
         except (OSError, ValueError) as exc:
             sys.exit(f"error: watch: {exc}")
         if log_fh:
             log_fh.close()
-        sys.exit(rc)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc)        # do not wait for audit threads abandoned on a timeout
 
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
 

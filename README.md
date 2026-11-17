@@ -735,10 +735,19 @@ so a record that is fixed and broken again is still seen.
 |---|---|
 | critical | takeover risk rises; spam appears; a dead high-tier name starts serving; a new certificate on a high-tier name; an unregistered nameserver domain gets registered |
 | warning | CNAME, addresses, nameservers or open ports change; disposition or title changes on a high-tier host; risk score up by 20 or more |
-| info | risk cleared (and the DNS changes that come with the fix); content changes on elevated hosts; tier changes |
+| info | risk cleared (and the DNS changes that come with the fix); content changes on elevated hosts; tier changes; a move inside the provider the name already uses |
 
 A field whose check did not run in either record (for example ports with `--ports none`)
-is not compared, so "not looked at" never reads as "gone".
+is not compared, so "not looked at" never reads as "gone". Further noise guards:
+
+- Address, nameserver and port lists are compared as sets: the same records in another order are no change.
+- A move inside the provider the name already uses is info, not a warning: the first CNAME hop is unchanged
+  (traffic-manager failover, CDN rotation) or the addresses stay in the same ASN, and the name still resolves.
+  A new first hop, or a direct address moving to another network, still alerts.
+- A CNAME, address or nameserver field that comes back empty once (usually a failed lookup) keeps its last
+  value; the empty value is accepted only when the next run sees it too.
+- A host that gives no result within `watch_host_timeout` seconds (tuning, default 300; slow, filtered or
+  tarpitted) is skipped for that run with its state kept; three timeouts in a row are logged.
 
 **Sinks.** All configured sinks are used together. The log (`<state>.alerts.log`, one JSON
 event per line) always gets every event; webhooks and email get events at or above

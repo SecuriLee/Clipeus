@@ -15,7 +15,15 @@ Tiers are derived from the evidence in each record, not from a host list:
             delegation, a dangling record nobody can reclaim, or exposure at or above
             the tuning value watch_elevated_exposure (default 40)
 A host whose risk clears stays in the elevated tier for watch_keep_days (default 7),
-so a record that is fixed and broken again is still watched.
+so a record that is fixed and broken again is still watched. A host that gives no
+result within watch_host_timeout seconds (default 300; slow, filtered or tarpitted)
+is skipped for that run with its state kept, so a tarpit neither hangs the run nor
+raises false alerts; three timeouts in a row are logged.
+
+To keep alerts meaningful: address and nameserver lists are compared as sets; a DNS
+field that comes back empty once keeps its last value until a second run agrees; and
+a move inside the provider the name already uses (same first CNAME hop, or addresses
+in the same ASN, still resolving) is logged as info rather than alerted.
 
 Alerts go to every configured sink at once: an append-only JSONL log (always), any
 number of webhooks (one JSON POST per run, accepted by Slack, Teams, Discord and
@@ -55,7 +63,14 @@ SNAPSHOT_FIELDS = ("dns_status", "cname", "a_records", "ipv6", "ns_servers", "ns
                    "http_status", "https_status", "final_url", "page_title", "body_sha256",
                    "cert_sha256", "cert_issuer", "cert_not_before", "disposition",
                    "dangling_status", "dangling_class", "takeover_risk", "takeover_outcome",
-                   "content_abuse", "ports", "risk_score", "risk_exposure", "scanned_at")
+                   "content_abuse", "ports", "risk_score", "risk_exposure", "asn", "scanned_at")
+
+# List-valued fields: compared as sets, so a resolver returning the same records in
+# another order is not a change.
+SET_FIELDS = ("a_records", "ipv6", "ns_servers", "ports")
+# DNS fields where one empty answer is more often a failed lookup than a real change:
+# an empty value replaces a known one only when two runs in a row agree.
+CONFIRM_EMPTY_FIELDS = ("cname", "a_records", "ipv6", "ns_servers")
 
 
 def _now() -> datetime:
@@ -103,10 +118,46 @@ FIELD_CHECK = {"ports": "ports", "cert_sha256": "tls", "cert_issuer": "tls", "ce
                "ns_registration": "rdap"}
 
 
+def _empty(v: Any) -> bool:
+    return v is None or str(v).strip() in ("", "N/A", "None")
+
+
+def _norm(field: str, v: Any) -> str:
+    if field in SET_FIELDS and not _empty(v):
+        return ",".join(sorted({x.strip() for x in str(v).split(",") if x.strip()}))
+    return str(v if v is not None else "N/A")
+
+
 def snapshot(rec: Dict[str, Any]) -> Dict[str, Any]:
     checks = dict(p.split("=", 1) for p in str(rec.get("checks", "")).split(";") if "=" in p)
-    return {k: rec.get(k, "N/A") for k in SNAPSHOT_FIELDS
+    return {k: (_norm(k, rec.get(k, "N/A")) if k in SET_FIELDS else rec.get(k, "N/A"))
+            for k in SNAPSHOT_FIELDS
             if not (k in FIELD_CHECK and checks.get(FIELD_CHECK[k]) == "not_run")}
+
+
+def hold_empty(entry: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
+    """Keep the last known value of a DNS field that came back empty once.
+    The empty value is accepted when the next run sees it too. Mutates `new`
+    and entry['pending_empty']; returns the fields held this run."""
+    old = entry.get("snapshot", {})
+    pending = set(entry.get("pending_empty", []))
+    held = []
+    for f in CONFIRM_EMPTY_FIELDS:
+        if f in old and f in new and _empty(new[f]) and not _empty(old[f]):
+            if f in pending:
+                pending.discard(f)          # second empty answer in a row: real
+            else:
+                pending.add(f)
+                new[f] = old[f]
+                held.append(f)
+        else:
+            pending.discard(f)
+    entry["pending_empty"] = sorted(pending)
+    return held
+
+
+def _first_hop(chain: Any) -> str:
+    return "" if _empty(chain) else str(chain).split("->")[0].strip().lower().rstrip(".")
 
 
 def _registered_ns(value: str) -> Dict[str, str]:
@@ -129,7 +180,7 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     def changed(f: str) -> bool:
         if f not in old or f not in new:      # not observed on one side: no comparison
             return False
-        return str(old.get(f, "N/A")) != str(new.get(f, "N/A"))
+        return _norm(f, old.get(f, "N/A")) != _norm(f, new.get(f, "N/A"))
 
     high = tier == "high"
     risk_rank = {"No": 0, "N/A": 0, "Possibly": 1, "Yes": 2}
@@ -159,10 +210,21 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
             add("critical", "ns-domain-registered",
                 f"nameserver domain {dom} is now registered ({res})", "ns_registration",
                 reg0.get(dom), res)
+    # Moves inside the provider the name already points at (traffic-manager failover,
+    # CDN address rotation) are the provider's business, not a new target: the name's
+    # own CNAME is unchanged, or the addresses stay in the same network (ASN), and it
+    # still resolves. Logged as info; a takeover or dangling change is judged above.
+    resolves = new.get("dns_status") == "OK"
+    same_hop = bool(_first_hop(old.get("cname"))) and _first_hop(old.get("cname")) == _first_hop(new.get("cname"))
+    same_asn = not _empty(old.get("asn")) and str(old.get("asn")) == str(new.get("asn"))
     for f, kind in (("cname", "dns-target-changed"), ("a_records", "address-changed"),
-                    ("ns_servers", "nameservers-changed"), ("ports", "ports-changed")):
+                    ("ipv6", "address-changed"), ("ns_servers", "nameservers-changed"),
+                    ("ports", "ports-changed")):
         if changed(f):
-            add("warning", kind, f"{f}: {old.get(f)} -> {new.get(f)}", f, old.get(f), new.get(f))
+            internal = resolves and (same_hop if f == "cname" else
+                                     f in ("a_records", "ipv6") and (same_hop or same_asn))
+            add("info" if internal else "warning", kind + ("-within-provider" if internal else ""),
+                f"{f}: {old.get(f)} -> {new.get(f)}", f, old.get(f), new.get(f))
     if changed("disposition") and not (was_dead and now_up):
         add("warning", "disposition-changed", f"{old.get('disposition')} -> {new.get('disposition')}",
             "disposition", old.get("disposition"), new.get("disposition"))
@@ -516,9 +578,45 @@ def merge_alert_config(cfg_alerts: Dict[str, Any], args: Any, state_path: str) -
 
 # ---------------------------------------------------------------- run
 
+def audit_with_deadline(hosts: List[str], audit_host: Callable[[str], Any], workers: int,
+                        host_timeout: int) -> Tuple[List[Tuple[str, Any]], List[str]]:
+    """Audit hosts in parallel; a host still running after `host_timeout` seconds is
+    abandoned (a tarpit can drip bytes under every per-request timeout). Returns
+    (finished results, timed-out hosts). Abandoned threads are left behind; the
+    caller must end the process without waiting for them."""
+    started: Dict[str, float] = {}
+
+    def one(h: str):
+        started[h] = time.monotonic()
+        return audit_host(h)
+    ex = ThreadPoolExecutor(max_workers=max(1, min(workers, len(hosts) or 1)))
+    futs = {ex.submit(one, h): h for h in hosts}
+    results: List[Tuple[str, Any]] = []
+    timed_out: List[str] = []
+    pending = set(futs)
+    while pending:
+        done = {f for f in pending if f.done()}
+        for f in done:
+            try:
+                results.append((futs[f], f.result()))
+            except Exception as exc:
+                results.append((futs[f], {"error": f"{type(exc).__name__}: {exc}"}))
+        pending -= done
+        now = time.monotonic()
+        for f in list(pending):
+            h = futs[f]
+            if h in started and now - started[h] > host_timeout:
+                timed_out.append(h)
+                pending.discard(f)
+        if pending:
+            time.sleep(0.5)
+    ex.shutdown(wait=False, cancel_futures=True)
+    return results, timed_out
+
+
 def run(args: Any, alerts_cfg: Dict[str, Any], log: Callable[[str], None],
         audit_host: Callable[[str], Any], elevated_exposure: int = 40, keep_days: int = 7,
-        workers: int = 8) -> int:
+        workers: int = 8, host_timeout: int = 300) -> int:
     """One watch cycle. Returns the process exit code: 0 quiet, 4 alerts raised,
     5 a sink failed (alerts may not have been delivered)."""
     state_path = args.watch_state or os.path.join(
@@ -550,14 +648,27 @@ def run(args: Any, alerts_cfg: Dict[str, Any], log: Callable[[str], None],
 
     events: List[Dict[str, Any]] = []
     now = _now()
-    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(due) or 1))) as ex:
-        results = list(ex.map(lambda h: (h, audit_host(h)), due))
+    results, timed_out = audit_with_deadline(due, audit_host, workers, host_timeout)
+    for host in timed_out:
+        entry = st["hosts"][host]
+        entry["timeouts"] = int(entry.get("timeouts", 0)) + 1
+        log(f"[watch] {host}: no result within {host_timeout}s (slow or tarpitted); state kept, "
+            f"{entry['timeouts']} timeout(s) in a row")
+        if entry["timeouts"] == 3:
+            events.append({"host": host, "tier": entry.get("tier"), "severity": "info",
+                           "kind": "repeated-timeout",
+                           "detail": f"no result within {host_timeout}s on 3 runs in a row "
+                                     "(slow, filtered or tarpitted); nothing compared",
+                           "field": "", "before": None, "after": None})
     for host, rec in results:
         entry = st["hosts"][host]
+        entry["timeouts"] = 0
         if rec is None or rec.get("error"):
             log(f"[watch] {host}: audit error ({(rec or {}).get('error', 'none returned')}); state kept")
             continue
         new = snapshot(rec)
+        for f in hold_empty(entry, new):
+            log(f"[watch] {host}: {f} came back empty; last value kept until the next run confirms")
         old_tier = entry.get("tier")
         events += compare(host, old_tier, entry.get("snapshot", {}), new)
         t = tier_of(rec, elevated_exposure)
