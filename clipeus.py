@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.9"
+__version__ = "26.11.10"
 
 import argparse
 import base64
@@ -2285,6 +2285,14 @@ def assess_platforms(technology: str, server: str = "", powered_by: str = "",
     return "; ".join(notes)
 
 
+def own_response(resp: Any) -> Any:
+    """The host's own answer: the first response of a redirect chain. Whether the
+    host sits behind a CDN is a property of the host, not of the site it redirects
+    to (an off-site target moving to another provider must not change it)."""
+    hist = getattr(resp, "history", None) or []
+    return hist[0] if hist else resp
+
+
 def detect_cdn(headers: Any, server: str, asn: str, cname: str) -> str:
     header_keys = " ".join(k.lower() for k in headers.keys()) if headers else ""
     server_l, asn_l, cname_l = server.lower(), asn.lower(), cname.lower()
@@ -2604,7 +2612,9 @@ def get_web_data(domain: str, session: requests.Session, args: argparse.Namespac
                    and h != "X-XSS-Protection" and not (h == "X-Frame-Options" and has_fa)]
         rec.sec_headers_missing = ",".join(missing) if missing else "None"
     rec.page_type = "Static" if rec.size < 10000 else "Dynamic"
-    rec.cdn = detect_cdn(winner.headers, rec.server, rec.asn, rec.cname)
+    own = own_response(winner)
+    rec.cdn = detect_cdn(own.headers, own.headers.get("Server", "") if own is not winner else rec.server,
+                         rec.asn, rec.cname)
     raw["winner"] = {"url": winner.url, "headers": dict(winner.headers),
                      "body_len": len(body), "truncated": getattr(winner, "truncated", False)}
 
@@ -4780,6 +4790,14 @@ def selftest() -> int:
     dm = parse_dmarc(["v=DMARC1; p=none"])
     check("dmarc_policy_none" in dm["dmarc_issues"], "DMARC p=none flagged")
     check(detect_cdn({"cf-ray": "x"}, "cloudflare", "AS13335", "")[:5] == "Cloud", "CDN detect")
+    class _R:
+        def __init__(self, headers, history=()):
+            self.headers, self.history = headers, list(history)
+    _hop = _R({"Server": "cloudflare", "CF-RAY": "x"})
+    _end = _R({"Server": "OtherEdge"}, [_hop])
+    _own = own_response(_end)
+    check(_own is _hop and detect_cdn(_own.headers, _own.headers.get("Server", ""), "N/A", "")[:5] == "Cloud",
+          "CDN detect: judged on the host's own response, not the off-site redirect target")
     check(len(FIELDNAMES) == len(set(FIELDNAMES)), "fieldnames unique")
     check(registrable_domain("a.b.example.com") == "example.com", "registrable domain")
     check(registrable_domain("foo.bar.co.uk") == "bar.co.uk", "registrable multi-suffix")
@@ -5334,9 +5352,10 @@ def selftest() -> int:
             os.environ.pop("CLIPEUS_SELFTEST_HOOK", None)
         check(failed == 0 and logged == len(evs) and sent["hook"][1]["events"] and sent["smtp"] == ("mail.example", 587)
               and sent.get("tls") and sent["login"] == ("u", "pw-from-env") and sent["mail"][0] == "a@example.com"
-              and sent["parts"] == ["text/plain"] and sent["hook"][0] == "https://hooks.example/x",
+              and sent["parts"] == ["multipart/alternative", "text/plain", "text/html"]
+              and sent["hook"][0] == "https://hooks.example/x",
               "watch: every event logged; webhook URL and SMTP password come from the environment; "
-              "email is one plain-text part over STARTTLS")
+              "email is plain text plus its HTML alternative (no attachments) over STARTTLS")
         def _slow(h):
             if h == "tarpit.example":
                 time.sleep(3)
@@ -5363,6 +5382,28 @@ def selftest() -> int:
         check([e["severity"] for e in ev] == ["warning"], "watch: a new first CNAME hop still alerts")
         s_failed = _w.snapshot({**base, "ports": "21,22,23,445", "checks": "ports=failed"})
         check("ports" not in s_failed, "watch: the output of a failed check (ports=failed) is not compared")
+        _cdnrec = {**base, "ports": "", "cdn": "Cloudflare", "checks": "ports=not_applicable"}
+        s_cdn = _w.snapshot(_cdnrec)
+        ev_out = _w.compare("h.example", "elevated", _w.snapshot({**base, "ports": "443,80,8080,8443",
+                                                                  "checks": "ports=passed"}), s_cdn)
+        ev_old = _w.compare("h.example", "elevated", {**s_cdn, "ports": ""}, s_cdn)
+        ev_off = _w.compare("h.example", "elevated", s_cdn, _w.snapshot({**base, "ports": "80,443",
+                                                                         "checks": "ports=passed"}))
+        check(s_cdn["ports"] == "not scanned (CDN)"
+              and [e["after"] for e in ev_out if e["kind"] == "ports-changed"] == ["not scanned (CDN)"]
+              and not ev_old and [e["before"] for e in ev_off if e["kind"] == "ports-changed"]
+              == ["not scanned (CDN)"],
+              "watch: ports behind a CDN read 'not scanned (CDN)'; leaving the CDN still alerts")
+        _hev = [{"host": "h.example", "tier": "elevated", "severity": "warning", "kind": "title-changed",
+                 "detail": "title '<script>x</script>'", "field": "page_title", "before": "a&b",
+                 "after": "<img src=x onerror=1>"},
+                {"host": "h.example", "tier": "elevated", "severity": "warning", "kind": "address-changed",
+                 "detail": "a_records", "field": "a_records", "before": "192.0.2.1,192.0.2.2",
+                 "after": "192.0.2.2,192.0.2.3"}]
+        _html = _w.email_html("Clipeus watch: 2 change(s), worst warning", _hev)
+        check("<script>" not in _html and "<img" not in _html and "&lt;script&gt;" in _html
+              and "+192.0.2.3" in _html and "\u2212192.0.2.1" in _html,
+              "watch: HTML mail escapes scanned values and shows list deltas")
         lan = {"dns_status": "OK", "cname": "N/A", "a_records": "10.0.0.5", "http_status": "0", "https_status": "0"}
         ev = _w.compare("h.example", "high", _w.snapshot(lan),
                         _w.snapshot({**lan, "http_status": "200", "https_status": "200", "cert_sha256": "ab"}))

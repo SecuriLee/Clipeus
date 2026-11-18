@@ -142,11 +142,20 @@ def _norm(field: str, v: Any) -> str:
     return str(v if v is not None else "N/A")
 
 
+# Ports are not scanned behind a CDN (its edge's ports are not the site's). Saying so
+# keeps "not scanned" apart from "scanned, nothing open" in the log and in alerts.
+PORTS_CDN = "not scanned (CDN)"
+
+
 def snapshot(rec: Dict[str, Any]) -> Dict[str, Any]:
     checks = dict(p.split("=", 1) for p in str(rec.get("checks", "")).split(";") if "=" in p)
-    return {k: (_norm(k, rec.get(k, "N/A")) if k in SET_FIELDS else rec.get(k, "N/A"))
+    snap = {k: (_norm(k, rec.get(k, "N/A")) if k in SET_FIELDS else rec.get(k, "N/A"))
             for k in SNAPSHOT_FIELDS
             if not (k in FIELD_CHECK and checks.get(FIELD_CHECK[k]) in ("not_run", "failed"))}
+    if ("ports" in snap and checks.get("ports") == "not_applicable"
+            and str(rec.get("cdn", "No")) not in ("No", "", "N/A", "None")):
+        snap["ports"] = PORTS_CDN
+    return snap
 
 
 _LOCAL_NETS = tuple(ipaddress.ip_network(n) for n in (
@@ -248,6 +257,8 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     def changed(f: str) -> bool:
         if f not in old or f not in new:      # not observed on one side: no comparison
             return False
+        if f == "ports" and {str(old[f]), str(new[f])} == {"", PORTS_CDN}:
+            return False                      # state from before the marker existed
         return _norm(f, old.get(f, "N/A")) != _norm(f, new.get(f, "N/A"))
 
     high = tier == "high"
@@ -456,6 +467,79 @@ def email_body(text: str, events: List[Dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+_SEV_STYLE = {"critical": ("#ffffff", "#b42318"), "warning": ("#3d2a00", "#f5b83d"),
+              "info": ("#344054", "#e4e7ec")}
+
+
+def _list_delta(before: Any, after: Any) -> str:
+    """'+added  -removed' for list fields, so a changed address set reads at a glance."""
+    b = {x.strip() for x in str(before or "").split(",") if x.strip() and x.strip() not in ("N/A", "None")}
+    a = {x.strip() for x in str(after or "").split(",") if x.strip() and x.strip() not in ("N/A", "None")}
+    parts = [f"+{x}" for x in sorted(a - b)] + [f"\u2212{x}" for x in sorted(b - a)]
+    return "  ".join(parts)
+
+
+def email_html(text: str, events: List[Dict[str, Any]]) -> str:
+    """HTML alternative of email_body: one card per host, changes as rows, before and
+    after side by side. Every value is escaped: titles, URLs and banners come from
+    the scanned sites. Inline styles and tables only, which mail clients render."""
+    from html import escape as h
+    evs = sorted(events, key=lambda e: (-_SEV[e["severity"]], e["host"]))
+    head = text.splitlines()[0] if text else "Clipeus watch"
+    counts = {s: sum(1 for e in evs if e["severity"] == s) for s in ("critical", "warning", "info")}
+    font = "font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
+    mono = "font-family:SFMono-Regular,Consolas,Menlo,monospace;font-size:12px"
+
+    def badge(sev: str) -> str:
+        fg, bg = _SEV_STYLE.get(sev, _SEV_STYLE["info"])
+        return (f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;background:{bg};'
+                f'color:{fg};font-size:11px;font-weight:600;text-transform:uppercase">{h(sev)}</span>')
+
+    pills = " ".join(f"{badge(s)} <span style=\"color:#475467;font-size:13px\">{n}</span>&nbsp;&nbsp;"
+                     for s, n in counts.items() if n)
+    out = [f'<!doctype html><html><body style="margin:0;padding:16px;background:#f2f4f7;{font};color:#101828">',
+           '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+           'style="max-width:760px;margin:0 auto">',
+           f'<tr><td style="padding:4px 0 12px"><div style="font-size:18px;font-weight:600">{h(head)}</div>'
+           f'<div style="margin-top:6px">{pills}</div></td></tr>']
+    hosts: Dict[str, List[Dict[str, Any]]] = {}
+    for e in evs:
+        hosts.setdefault(e["host"], []).append(e)
+    for host, hev in hosts.items():
+        out.append('<tr><td style="padding:0 0 12px"><table role="presentation" width="100%" cellpadding="0" '
+                   'cellspacing="0" style="background:#ffffff;border:1px solid #e4e7ec;border-radius:8px">')
+        out.append(f'<tr><td style="padding:12px 16px;border-bottom:1px solid #e4e7ec">'
+                   f'<span style="font-size:15px;font-weight:600;word-break:break-all">{h(host)}</span>'
+                   f'&nbsp; <span style="color:#667085;font-size:12px">{h(str(hev[0].get("tier")))} tier</span>'
+                   f'</td></tr>')
+        for e in hev:
+            row = [f'<tr><td style="padding:10px 16px;border-bottom:1px solid #f2f4f7">',
+                   f'{badge(e["severity"])} <span style="font-weight:600;font-size:13px">{h(e["kind"])}</span>',
+                   f'<div style="margin-top:4px;font-size:13px;color:#344054;word-break:break-word">'
+                   f'{h(str(e["detail"]))}</div>']
+            if e.get("field") and (e.get("before") is not None or e.get("after") is not None):
+                b, a = e.get("before"), e.get("after")
+                cell = f"padding:4px 8px;{mono};vertical-align:top;word-break:break-all"
+                row.append('<table role="presentation" cellpadding="0" cellspacing="0" width="100%" '
+                           'style="margin-top:8px;border-collapse:collapse;background:#f9fafb">'
+                           f'<tr><td style="{cell};color:#667085;width:70px">before</td>'
+                           f'<td style="{cell}">{h(str(b)) if not _empty(b) else "<i>(empty)</i>"}</td></tr>'
+                           f'<tr><td style="{cell};color:#667085">after</td>'
+                           f'<td style="{cell}">{h(str(a)) if not _empty(a) else "<i>(empty)</i>"}</td></tr>')
+                if e["field"] in SET_FIELDS and PORTS_CDN not in (str(b), str(a)):
+                    delta = _list_delta(b, a)
+                    if delta:
+                        row.append(f'<tr><td style="{cell};color:#667085">delta</td>'
+                                   f'<td style="{cell}">{h(delta)}</td></tr>')
+                row.append('</table>')
+            row.append('</td></tr>')
+            out.append("".join(row))
+        out.append('</table></td></tr>')
+    out.append('<tr><td style="padding:4px 0;color:#667085;font-size:12px">Sent by Clipeus watch mode. '
+               'The full event log is kept on the scanning host.</td></tr></table></body></html>')
+    return "\n".join(out)
+
+
 class _VerifiedSMTPSSL(smtplib.SMTP_SSL):
     """SMTP over implicit TLS that verifies the certificate against `tls_name`
     whatever address it connects to."""
@@ -481,6 +565,8 @@ def send_email(conf: Dict[str, Any], to: List[str], subject: str, text: str,
     msg["From"] = conf.get("from") or f"clipeus@{host}"
     msg["To"] = ", ".join(to)
     msg.set_content(email_body(text, events))
+    if conf.get("format", "html") != "text":   # plain text stays as the first part
+        msg.add_alternative(email_html(text, events), subtype="html")
     ctx = ssl.create_default_context()
     # smtp_connect: the address to dial when it differs from the certificate's name
     # (e.g. a relay that allow-lists a VPN address). TLS is still verified against

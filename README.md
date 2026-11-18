@@ -805,6 +805,9 @@ that failed (for example a filter answering every port). Further noise guards:
   scanning host's own network can reach them. Takeover, spam and nameserver-registration alerts keep their severity.
 - A CNAME, address or nameserver field that comes back empty once (usually a failed lookup) keeps its last
   value; the empty value is accepted only when the next run sees it too.
+- Ports are not scanned behind a CDN; the snapshot records `not scanned (CDN)` rather than an empty
+  list, so "not scanned" and "nothing open" stay apart, and a host leaving its CDN reads
+  `not scanned (CDN) -> 80,443`.
 - A host that answered last run and looks dead now (`dead-dns` / `dead-nohttp`) with its DNS status and
   takeover verdict unchanged keeps its last state for one run; the outage is reported when the next run agrees.
 - A host that gives no result within `watch_host_timeout` seconds (tuning, default 300; slow, filtered or
@@ -817,7 +820,10 @@ event per line) always gets every event; webhooks and email get events at or abo
 - **Webhook:** `--alert-webhook-env VAR` (repeatable) or `alerts.webhooks` in the config,
   each `{"url_env": "VAR", "format": "generic|slack|teams|discord"}`. The URL is read from
   the environment variable, never from the file.
-- **Email** (plain text), any SMTP service: `alerts.email` in the config or the flags
+- **Email**, any SMTP service: a plain-text part followed by an HTML alternative (one card per
+  host, before/after side by side, added and removed list entries marked; every scanned value
+  escaped). No attachments. `"format": "text"` in `alerts.email` sends the plain-text part only.
+  Configure it with `alerts.email` in the config or the flags
   `--alert-smtp-host`, `--alert-smtp-port`, `--alert-smtp-security starttls|ssl|none`,
   `--alert-smtp-user`, `--alert-email-from`, `--alert-email ADDR`. With a login name the
   password is read from `$CLIPEUS_SMTP_PASSWORD` (or the variable named in
