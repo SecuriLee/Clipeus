@@ -798,9 +798,10 @@ that failed (for example a filter answering every port). Further noise guards:
 
 - Address, nameserver and port lists are compared as sets: the same records in another order are no change.
 - A move inside the provider the name already uses is info, not a warning: the first CNAME hop is unchanged
-  (traffic-manager failover, CDN rotation), the addresses stay in the same ASN or behind the same detected CDN,
+  (traffic-manager failover, CDN rotation), the addresses stay in the same ASN,
   or every IPv6 address before and after sits in one /32 allocation (anycast rotation), and the name still resolves.
-  A new first hop, or a direct address moving to another network, still alerts.
+  A new first hop, or a direct address moving to another network, still alerts, even when the
+  response headers still name the same CDN (headers can come from a cached or passed-through answer).
 - Changes on a name whose addresses are all private (RFC 1918 and similar) are info: only the
   scanning host's own network can reach them. Takeover, spam and nameserver-registration alerts keep their severity.
 - A CNAME, address or nameserver field that comes back empty once (usually a failed lookup) keeps its last

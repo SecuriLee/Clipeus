@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.10"
+__version__ = "26.11.11"
 
 import argparse
 import base64
@@ -5426,7 +5426,8 @@ def selftest() -> int:
         check([e["severity"] for e in ev] == ["warning"], "watch: IPv6 moving to another allocation still alerts")
         ev = _w.compare("h.example", "elevated", _w.snapshot({**cf, "cdn": "SomeCDN"}),
                         _w.snapshot({**cf, "cdn": "SomeCDN", "a_records": "203.0.113.40"}))
-        check(ev and all(e["severity"] == "info" for e in ev), "watch: an address change behind the same CDN is info")
+        check([e["severity"] for e in ev] == ["warning"],
+              "watch: the same CDN in the response headers does not make an address move internal")
         live = {**cf, "disposition": "live", "http_status": "200", "https_status": "200",
                 "takeover_outcome": "none", "takeover_risk": "No"}
         dead = {**live, "disposition": "dead-nohttp", "http_status": "0", "https_status": "0"}

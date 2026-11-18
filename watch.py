@@ -310,15 +310,13 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     resolves = new.get("dns_status") == "OK"
     same_hop = bool(_first_hop(old.get("cname"))) and _first_hop(old.get("cname")) == _first_hop(new.get("cname"))
     same_asn = not _empty(old.get("asn")) and str(old.get("asn")) == str(new.get("asn"))
-    same_cdn = (str(old.get("cdn", "")) not in ("", "N/A", "None", "unknown")
-                and old.get("cdn") == new.get("cdn"))
     same_v6 = _same_v6_allocation(old.get("ipv6"), new.get("ipv6"))
     for f, kind in (("cname", "dns-target-changed"), ("a_records", "address-changed"),
                     ("ipv6", "address-changed"), ("ns_servers", "nameservers-changed"),
                     ("ports", "ports-changed")):
         if changed(f):
             internal = resolves and (same_hop if f == "cname" else
-                                     f in ("a_records", "ipv6") and (same_hop or same_asn or same_cdn
+                                     f in ("a_records", "ipv6") and (same_hop or same_asn
                                                                      or (f == "ipv6" and same_v6)))
             add("info" if internal else "warning", kind + ("-within-provider" if internal else ""),
                 f"{f}: {old.get(f)} -> {new.get(f)}", f, old.get(f), new.get(f))
