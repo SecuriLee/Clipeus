@@ -503,16 +503,19 @@ on another registrable domain (an off-site redirect) is not judged (`N/A (page o
 `--no-resources` turns the check off; tuning `resources_max` (40 per page) and
 `resources_iframes` (5) bound it. The `resources` entry in `checks` records the state.
 
-**Mail-side records.** `mx_dangling` lists exchanges that do not resolve; one in an
-unregistered domain (`=NXDOMAIN(domain-unregistered:x)`) means anyone can register it and
-receive the mail. `dmarc_rua_risk` lists DMARC report destinations (`rua`/`ruf`) in an
+**Mail-side records.** `mx_dangling` lists exchanges that do not resolve. Two are
+claimable: one in an unregistered domain (`=NXDOMAIN(domain-unregistered:x)`), and a
+deleted cloud name the provider gives out again (`=NXDOMAIN(provider-released:p)`, e.g. a
+`cloudapp.azure.com` label). Whoever takes it receives the domain's mail, including the
+validation mail certificate authorities send. `=NXDOMAIN(provider:p)` is a provider name
+whose reuse policy is unknown. `dmarc_rua_risk` lists DMARC report destinations (`rua`/`ruf`) in an
 unregistered domain (`unregistered(x)`: the reports, with sending-source data, go to
 whoever registers it) and external destinations without the RFC 7489 authorisation record
 (`unauthorised(x)`: receivers drop those reports). Both need `rdap` to judge registration;
 a failed lookup is "unknown", never "unregistered".
 
 Scoring: a claimable script +40 exposure (iframe +25, stylesheet +20; half for
-`potentially-claimable`), an MX in an unregistered domain +40, DMARC reports to an
+`potentially-claimable`), an MX in an claimable MX +40, DMARC reports to an
 unregistered domain +15; a CSP script source anyone can publish under +5 and stale
 resources +3 hygiene. Watch mode treats a claimable resource or MX as high tier and alerts
 `critical` when one appears.
@@ -795,12 +798,15 @@ that failed (for example a filter answering every port). Further noise guards:
 
 - Address, nameserver and port lists are compared as sets: the same records in another order are no change.
 - A move inside the provider the name already uses is info, not a warning: the first CNAME hop is unchanged
-  (traffic-manager failover, CDN rotation) or the addresses stay in the same ASN, and the name still resolves.
+  (traffic-manager failover, CDN rotation), the addresses stay in the same ASN or behind the same detected CDN,
+  or every IPv6 address before and after sits in one /32 allocation (anycast rotation), and the name still resolves.
   A new first hop, or a direct address moving to another network, still alerts.
 - Changes on a name whose addresses are all private (RFC 1918 and similar) are info: only the
   scanning host's own network can reach them. Takeover, spam and nameserver-registration alerts keep their severity.
 - A CNAME, address or nameserver field that comes back empty once (usually a failed lookup) keeps its last
   value; the empty value is accepted only when the next run sees it too.
+- A host that answered last run and looks dead now (`dead-dns` / `dead-nohttp`) with its DNS status and
+  takeover verdict unchanged keeps its last state for one run; the outage is reported when the next run agrees.
 - A host that gives no result within `watch_host_timeout` seconds (tuning, default 300; slow, filtered or
   tarpitted) is skipped for that run with its state kept; three timeouts in a row are logged.
 

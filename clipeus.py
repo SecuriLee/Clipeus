@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.8"  # CalVer YY.MM.patch; single source of truth (pyproject + banner + UA read this)
+__version__ = "26.11.9"
 
 import argparse
 import base64
@@ -795,7 +795,7 @@ class AuditRecord:
     resource_integrity: str = "N/A"    # all-sri / no-sri(n/m):hosts — third-party scripts without SRI
     iframe_sandbox: str = "N/A"        # host=none|tokens per third-party iframe
     csp_source_risks: str = "None"     # CSP host sources anyone can publish under (shared-tenant / public-package)
-    mx_dangling: str = "None"          # exchange=NXDOMAIN[(domain-unregistered:x)] / NOANSWER
+    mx_dangling: str = "None"          # exchange=NXDOMAIN[(domain-unregistered:x|provider-released:p|provider:p)] / NOANSWER
     dmarc_rua_risk: str = "None"       # unregistered(x) / unauthorised(x) DMARC report destinations
     cname_domain_lapsed: str = "None"  # CNAME target whose registrable domain is not registered
 
@@ -3139,8 +3139,8 @@ def score_parts(rec: AuditRecord) -> Dict[str, Any]:
         pts = 40 if "script" in kinds else 25 if "iframe" in kinds else 20
         add("exposure", pts if sure else pts // 2,
             f"Claimable page resource ({'+'.join(sorted(kinds))}; claim not verified)", confirmed=False)
-    if "domain-unregistered" in rec.mx_dangling:
-        add("exposure", 40, "MX in an unregistered domain (mail can be received by anyone)")
+    if thirdparty.mx_claimable(rec.mx_dangling):
+        add("exposure", 40, "Claimable MX (mail, incl. certificate validation, can be received by anyone)")
     elif rec.mx_dangling not in ("None", "", "N/A"):
         add("hygiene", 5, f"MX does not resolve ({rec.mx_dangling})")
     if "unregistered(" in rec.dmarc_rua_risk:
@@ -3771,7 +3771,8 @@ def process_domain(domain: str, session: requests.Session, args: argparse.Namesp
                          else (lambda r: registration_state(r, not args.no_whois)))
             if mx_hosts(rec.mx_records):
                 rec.mx_dangling = thirdparty.assess_mx(mx_hosts(rec.mx_records), host_state,
-                                                       reg_state, registrable_domain)
+                                                       reg_state, registrable_domain,
+                                                       provider_of=provider_of, policy=name_policy)
             if rec.dmarc not in ("None", "", "N/A"):
                 rec.dmarc_rua_risk = thirdparty.assess_dmarc_rua(
                     domain, rec.dmarc.replace(" (Inherited)", ""), reg_state, registrable_domain,
@@ -5375,6 +5376,27 @@ def selftest() -> int:
         held2 = _w.hold_empty(entry, n2)
         check(held1 == ["cname"] and n1["cname"] == base["cname"] and held2 == [] and n2["cname"] == "N/A",
               "watch: one empty DNS answer keeps the last value; a second one in a row is accepted")
+        cf = {"dns_status": "OK", "cname": "N/A", "a_records": "198.51.100.12", "ipv6": "2001:db8:3120::c",
+              "asn": "N/A", "cdn": "N/A"}
+        ev = _w.compare("h.example", "elevated", _w.snapshot(cf), _w.snapshot({**cf, "ipv6": "2001:db8:3121::c"}))
+        check(ev and all(e["severity"] == "info" for e in ev),
+              "watch: IPv6 rotating inside one /32 allocation (CDN anycast) is info, even without ASN data")
+        ev = _w.compare("h.example", "elevated", _w.snapshot(cf), _w.snapshot({**cf, "ipv6": "2001:db9::1"}))
+        check([e["severity"] for e in ev] == ["warning"], "watch: IPv6 moving to another allocation still alerts")
+        ev = _w.compare("h.example", "elevated", _w.snapshot({**cf, "cdn": "SomeCDN"}),
+                        _w.snapshot({**cf, "cdn": "SomeCDN", "a_records": "203.0.113.40"}))
+        check(ev and all(e["severity"] == "info" for e in ev), "watch: an address change behind the same CDN is info")
+        live = {**cf, "disposition": "live", "http_status": "200", "https_status": "200",
+                "takeover_outcome": "none", "takeover_risk": "No"}
+        dead = {**live, "disposition": "dead-nohttp", "http_status": "0", "https_status": "0"}
+        entry = {"snapshot": _w.snapshot(live)}
+        d1 = _w.hold_dead(entry, _w.snapshot(dead))
+        d2 = _w.hold_dead(entry, _w.snapshot(dead))
+        entry = {"snapshot": _w.snapshot(live)}
+        d3 = _w.hold_dead(entry, _w.snapshot({**dead, "takeover_outcome": "claimable-by-policy",
+                                               "takeover_risk": "Yes"}))
+        check(d1 and not d2 and not d3,
+              "watch: one dead result after a live one is held; a second confirms; a takeover change is never held")
         # ---- third-party resources (26.11.8), offline: DNS / RDAP / HTTP are fakes
         page = ('<base href="https://www.example.com/app/">'
                 '<script src="https://cdn.vendor.example/a.js" integrity="sha384-x"></script>'
@@ -5446,6 +5468,11 @@ def selftest() -> int:
                                   registrable_domain)
         check(mx == "mx.lapsed-mail.example=NXDOMAIN(domain-unregistered:lapsed-mail.example);old.example.com=NXDOMAIN",
               "mx: an exchange in an unregistered domain is claimable; a dead one in a registered domain is stale")
+        mx2 = thirdparty.assess_mx(["vm1.westus.cloudapp.azure.com"], lambda h: ("NXDOMAIN", []),
+                                   lambda r: "unknown", registrable_domain, provider_of, name_policy)
+        check(mx2 == "vm1.westus.cloudapp.azure.com=NXDOMAIN(provider-released:cloudapp.azure.com)"
+              and thirdparty.mx_claimable(mx2),
+              "mx: an exchange on a released cloud name (deleted cloudapp label) is claimable")
         rua = thirdparty.assess_dmarc_rua(
             "example.com", "v=DMARC1; p=reject; rua=mailto:d@reports.lapsed-dmarc.example,mailto:a@example.com,"
             "mailto:x@vendor.example; ruf=mailto:f@ok.example",

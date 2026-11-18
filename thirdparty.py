@@ -357,19 +357,38 @@ def assess_dmarc_rua(domain: str, dmarc_record: str, registration: Callable[[str
     return ";".join(dict.fromkeys(issues)) or "None"
 
 
+MX_CLAIMABLE = ("domain-unregistered", "provider-released")
+
+
+def mx_claimable(value: Any) -> bool:
+    """True when an mx_dangling value names an exchange someone else could take."""
+    return any(m in str(value or "") for m in MX_CLAIMABLE)
+
+
 def assess_mx(hosts: List[str], resolve: Callable[[str], Tuple[str, List[str]]],
-              registration: Callable[[str], str], registrable: Callable[[str], str]) -> str:
-    """'None', or ';'-joined host=reason for exchanges that do not resolve:
-    host=NXDOMAIN(domain-unregistered) is claimable (anyone can register the domain
-    and receive the mail); host=NXDOMAIN / NOANSWER is a stale record."""
+              registration: Callable[[str], str], registrable: Callable[[str], str],
+              provider_of: Callable[[List[str]], str] = lambda n: "",
+              policy: Callable[[str], str] = lambda t: "unknown") -> str:
+    """'None', or ';'-joined host=reason for exchanges that do not resolve. Claimable
+    (anyone can receive the domain's mail, including certificate-validation mail):
+    host=NXDOMAIN(domain-unregistered:x) — the exchange's domain is not registered;
+    host=NXDOMAIN(provider-released:p) — a deleted cloud name the provider gives out
+    again (e.g. a cloudapp label). host=NXDOMAIN(provider:p) — provider name, reuse
+    policy unknown. Otherwise host=NXDOMAIN / NOANSWER: a stale record."""
     out = []
     for h in hosts:
         status, chain = resolve(h)
         if status not in ("NXDOMAIN", "NOANSWER"):
             continue
-        reg = registrable((list(chain) or [h])[-1])
+        target = (list(chain) or [h])[-1]
+        reg = registrable(target)
+        provider = provider_of([h] + list(chain))
         if status == "NXDOMAIN" and reg and registration(reg) == "not-registered":
             out.append(f"{h}=NXDOMAIN(domain-unregistered:{reg})")
+        elif status == "NXDOMAIN" and provider and policy(target) == "released":
+            out.append(f"{h}=NXDOMAIN(provider-released:{provider})")
+        elif status == "NXDOMAIN" and provider:
+            out.append(f"{h}=NXDOMAIN(provider:{provider})")
         else:
             out.append(f"{h}={status}")
     return ";".join(out) or "None"

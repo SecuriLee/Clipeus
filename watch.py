@@ -66,7 +66,7 @@ SNAPSHOT_FIELDS = ("dns_status", "cname", "a_records", "ipv6", "ns_servers", "ns
                    "http_status", "https_status", "final_url", "page_title", "body_sha256",
                    "cert_sha256", "cert_issuer", "cert_not_before", "disposition",
                    "dangling_status", "dangling_class", "takeover_risk", "takeover_outcome",
-                   "content_abuse", "ports", "risk_score", "risk_exposure", "asn",
+                   "content_abuse", "ports", "risk_score", "risk_exposure", "asn", "cdn",
                    "resource_takeover", "mx_dangling", "dmarc_rua_risk", "scanned_at")
 
 # List-valued fields: compared as sets, so a resolver returning the same records in
@@ -109,7 +109,7 @@ def tier_of(rec: Dict[str, Any], elevated_exposure: int = 40) -> Optional[str]:
             or rec.get("content_abuse", "None") not in ("None", "", "N/A")
             or "not-registered" in str(rec.get("ns_registration", ""))
             or _present(rec.get("resource_takeover"))
-            or "domain-unregistered" in str(rec.get("mx_dangling", ""))
+            or any(m in str(rec.get("mx_dangling", "")) for m in ("domain-unregistered", "provider-released"))
             or rec.get("dangling_class") == "dangling-cname" and outcome in ("none", "N/A", "")):
         return "high"
     try:
@@ -187,6 +187,43 @@ def hold_empty(entry: Dict[str, Any], new: Dict[str, Any]) -> List[str]:
     return held
 
 
+DEAD_DISPOSITIONS = ("dead-dns", "dead-nohttp")
+
+
+def hold_dead(entry: Dict[str, Any], new: Dict[str, Any]) -> bool:
+    """A host that answered last run and looks dead now, with its DNS and takeover
+    verdict unchanged, is more often a dropped connection than a real outage. Keep
+    the last snapshot until the next run agrees. Mutates entry['pending_dead'];
+    returns True when this run's result is held back."""
+    old = entry.get("snapshot", {})
+    suspect = (new.get("disposition") in DEAD_DISPOSITIONS
+               and old.get("disposition") not in (None, *DEAD_DISPOSITIONS)
+               and new.get("dns_status") == old.get("dns_status") == "OK"
+               and new.get("takeover_outcome") == old.get("takeover_outcome")
+               and new.get("takeover_risk") == old.get("takeover_risk"))
+    if suspect and not entry.get("pending_dead"):
+        entry["pending_dead"] = True
+        return True
+    entry["pending_dead"] = False
+    return False
+
+
+def _same_v6_allocation(a: Any, b: Any) -> bool:
+    """All IPv6 addresses on both sides in one /32: one registry allocation, i.e.
+    one network operator (CDN anycast rotation), even with no ASN data at hand."""
+    nets = set()
+    for v in (a, b):
+        for x in str(v or "").split(","):
+            x = x.strip()
+            if not x or x in ("N/A", "None"):
+                continue
+            try:
+                nets.add(ipaddress.ip_network(f"{x}/32", strict=False))
+            except ValueError:
+                return False
+    return len(nets) == 1
+
+
 def _first_hop(chain: Any) -> str:
     return "" if _empty(chain) else str(chain).split("->")[0].strip().lower().rstrip(".")
 
@@ -227,8 +264,9 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
         add("critical", "claimable-resource",
             f"page loads a resource someone else could serve: {new.get('resource_takeover')}",
             "resource_takeover", old.get("resource_takeover"), new.get("resource_takeover"))
-    if changed("mx_dangling") and "domain-unregistered" in str(new.get("mx_dangling", "")):
-        add("critical", "claimable-mx", f"mail exchange in an unregistered domain: {new.get('mx_dangling')}",
+    if changed("mx_dangling") and any(m in str(new.get("mx_dangling", ""))
+                                      for m in ("domain-unregistered", "provider-released")):
+        add("critical", "claimable-mx", f"mail exchange someone else could take: {new.get('mx_dangling')}",
             "mx_dangling", old.get("mx_dangling"), new.get("mx_dangling"))
     elif changed("mx_dangling") and _present(new.get("mx_dangling")):
         add("warning", "mx-dangling", f"mail exchange does not resolve: {new.get('mx_dangling')}",
@@ -261,12 +299,16 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     resolves = new.get("dns_status") == "OK"
     same_hop = bool(_first_hop(old.get("cname"))) and _first_hop(old.get("cname")) == _first_hop(new.get("cname"))
     same_asn = not _empty(old.get("asn")) and str(old.get("asn")) == str(new.get("asn"))
+    same_cdn = (str(old.get("cdn", "")) not in ("", "N/A", "None", "unknown")
+                and old.get("cdn") == new.get("cdn"))
+    same_v6 = _same_v6_allocation(old.get("ipv6"), new.get("ipv6"))
     for f, kind in (("cname", "dns-target-changed"), ("a_records", "address-changed"),
                     ("ipv6", "address-changed"), ("ns_servers", "nameservers-changed"),
                     ("ports", "ports-changed")):
         if changed(f):
             internal = resolves and (same_hop if f == "cname" else
-                                     f in ("a_records", "ipv6") and (same_hop or same_asn))
+                                     f in ("a_records", "ipv6") and (same_hop or same_asn or same_cdn
+                                                                     or (f == "ipv6" and same_v6)))
             add("info" if internal else "warning", kind + ("-within-provider" if internal else ""),
                 f"{f}: {old.get(f)} -> {new.get(f)}", f, old.get(f), new.get(f))
     if changed("disposition") and not (was_dead and now_up):
@@ -720,6 +762,11 @@ def run(args: Any, alerts_cfg: Dict[str, Any], log: Callable[[str], None],
             log(f"[watch] {host}: audit error ({(rec or {}).get('error', 'none returned')}); state kept")
             continue
         new = snapshot(rec)
+        if hold_dead(entry, new):
+            log(f"[watch] {host}: looks {new.get('disposition')} after answering last run; "
+                "last state kept until the next run confirms")
+            entry["last_checked"] = _iso(now)
+            continue
         for f in hold_empty(entry, new):
             log(f"[watch] {host}: {f} came back empty; last value kept until the next run confirms")
         old_tier = entry.get("tier")
