@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.11"
+__version__ = "26.11.12"
 
 import argparse
 import base64
@@ -5057,6 +5057,53 @@ def selftest() -> int:
         requests.get, globals()["_censys_creds"] = _rg, _cc
         _CENSYS.update(calls=0, max=0)
         _censys_disabled.clear()
+    # --- Censys Platform API (HTTP stubbed; token and organisation from the environment)
+    _rp, _env = requests.post, {k: os.environ.get(k) for k in ("CENSYS_API_TOKEN", "CENSYS_ORG_ID")}
+    _posts: List[Any] = []
+    try:
+        os.environ["CENSYS_API_TOKEN"] = "censys_test"
+        os.environ.pop("CENSYS_ORG_ID", None)
+        requests.post = lambda *a, **k: (_posts.append((a, k)), _Resp(200, {}))[1]
+        r0 = censys_hostnames("cen.test")
+        check(r0 == [] and not _posts and _censys_disabled.is_set(),
+              "Censys Platform: without CENSYS_ORG_ID search is switched off before any call (Free plan)")
+        _censys_disabled.clear()
+        os.environ["CENSYS_ORG_ID"] = "00000000-0000-0000-0000-000000000000"
+        _seq = [_Resp(429), _Resp(200, {"result": {"buckets": [{"key": "a.cen.test", "count": 2},
+                                                                {"key": "cen.test.evil.example", "count": 1}]}}),
+                _Resp(200, {"result": {"buckets": [{"key": "WWW.cen.test", "count": 1}]}})]
+        _sl = time.sleep
+        time.sleep = lambda *_: None
+        requests.post = lambda *a, **k: (_posts.append((a, k)), _seq.pop(0))[1]
+        r1 = censys_hostnames("cen.test")
+        time.sleep = _sl
+        a0, k0 = _posts[-1]
+        check(r1 == ["a.cen.test", "www.cen.test"] and k0["params"]["organization_id"].startswith("0000")
+              and k0["headers"]["Authorization"] == "Bearer censys_test" and a0[0].endswith("/search/aggregate")
+              and k0["json"]["field"] == "web.hostname",
+              "Censys Platform: aggregate host DNS names and web hostnames; 429 retried; out-of-scope keys dropped")
+        _posts.clear()
+        requests.post = lambda *a, **k: (_posts.append((a, k)), _Resp(200, {"result": [
+            {"resource": {"ip": "192.0.2.10", "dns": {"names": ["shop.cen.test", "unrelated.example"],
+                                                       "reverse_dns": {"names": ["edge.cen.test"]}}}},
+            {"resource": {"ip": "192.0.2.11", "dns": {"names": ["other.example"]}}}]}))[1]
+        ipn = censys_ip_names(["192.0.2.10", "192.0.2.11"] * 3, ["cen.test"])
+        check(ipn == {"192.0.2.10": ["edge.cen.test", "shop.cen.test"]} and len(_posts) == 1
+              and _posts[0][1]["json"]["host_ids"] == ["192.0.2.10", "192.0.2.11"],
+              "Censys Platform: IP lookups keep only in-scope names, deduplicated, 100 per call")
+        requests.post = lambda *a, **k: _Resp(403, {"detail": "no access"})
+        _censys_disabled.clear()
+        censys_ip_names(["192.0.2.12"], ["cen.test"])
+        check(_censys_disabled.is_set(), "Censys Platform: 403 switches the source off for the run")
+    finally:
+        requests.post = _rp
+        for k, v in _env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        _CENSYS.update(calls=0, max=0)
+        _censys_disabled.clear()
 
     # --- response cap: local server only, no external traffic
     import http.server as _hs
@@ -5858,10 +5905,129 @@ def _censys_take_call(log=None) -> bool:
     return False
 
 
+CENSYS_PLATFORM = "https://api.platform.censys.io/v3/global"
+# The Platform API allows one concurrent action on the Free and Starter plans
+# (organisation-wide): every Platform call goes through this lock.
+_censys_one = threading.Lock()
+
+
+def _censys_platform() -> Optional[Tuple[str, str]]:
+    """Censys Platform personal access token and organisation ID, from the environment
+    only (CENSYS_API_TOKEN, CENSYS_ORG_ID). No organisation ID = Free plan: lookups
+    work, search and aggregate do not."""
+    tok = os.environ.get("CENSYS_API_TOKEN", "").strip()
+    return (tok, os.environ.get("CENSYS_ORG_ID", "").strip()) if tok else None
+
+
+def censys_configured() -> bool:
+    return _censys_platform() is not None or _censys_creds() is not None
+
+
+def _censys_platform_post(path: str, body: Dict[str, Any], accept: str, label: str, log=None) -> Optional[Any]:
+    """One Platform API call with the run-wide cap and kill switch. 429 = the plan's
+    concurrency limit, 503 = the per-IP request rate: both retried with backoff.
+    Returns the decoded 'result', or None."""
+    tok, org = _censys_platform() or ("", "")
+    params = {"organization_id": org} if org else {}
+    for attempt in range(4):
+        if STOP.is_set() or not _censys_take_call(log):
+            return None
+        try:
+            with _censys_one:
+                RL.wait()
+                r = requests.post(f"{CENSYS_PLATFORM}{path}", params=params, json=body, timeout=60,
+                                  headers={"Authorization": f"Bearer {tok}", "Accept": accept,
+                                           "Content-Type": "application/json"})
+            if r.status_code == 200:
+                return r.json().get("result")
+            if r.status_code in (429, 503) and attempt < 3:
+                wait = int(r.headers.get("Retry-After", "0") or 0) or (2 ** attempt + 1)
+                time.sleep(min(wait, 30))
+                continue
+            if r.status_code in (401, 402, 403):
+                detail = ""
+                try:
+                    detail = str(r.json().get("detail", ""))[:160]
+                except Exception:
+                    pass
+                _censys_disable(f"HTTP {r.status_code} on {path}: {detail or 'token rejected or no credits'}", log)
+                return None
+            if log:
+                log(f"[censys] {label}: HTTP {r.status_code}")
+            return None
+        except Exception as exc:
+            if log:
+                log(f"[censys] {label}: ERROR {exc}")
+            return None
+    return None
+
+
+def _in_scope(name: str, q: str) -> bool:
+    return name == q or name.endswith("." + q)
+
+
+def censys_platform_hostnames(query: str, log=None) -> List[str]:
+    """Hostnames under `query` from the Censys Platform: aggregations of host DNS
+    names and web-property hostnames matching the domain. Needs CENSYS_ORG_ID (a paid
+    plan); without one the Free plan refuses search, so the source is switched off
+    once with that reason instead of failing per domain."""
+    tok, org = _censys_platform() or ("", "")
+    if not tok or _censys_disabled.is_set():
+        return []
+    if not org:
+        _censys_disable("CENSYS_ORG_ID is not set: the Free plan allows lookups only, not search "
+                        "(recon/censys-ip-names.py uses lookups)", log)
+        return []
+    q = query.lstrip(".").lower()
+    rx = "(^|\\.)" + re.escape(q) + "$"
+    out: set = set()
+    for field in ("host.dns.names", "web.hostname"):
+        res = _censys_platform_post("/search/aggregate",
+                                    {"query": f"{field}=~`{rx}`", "field": field,
+                                     "number_of_buckets": 2000},
+                                    "application/json", f"{q} ({field})", log)
+        for b in (res or {}).get("buckets") or []:
+            h = normalize_host(str(b.get("key", "")))
+            if h and _in_scope(h, q):
+                out.add(h)
+    if log:
+        log(f"[censys] {q}: {len(out)} hostnames")
+    return sorted(out)
+
+
+def censys_ip_names(ips: List[str], suffixes: List[str], log=None) -> Dict[str, List[str]]:
+    """Names Censys has seen pointing at each IP (host lookups, 100 per call; works on
+    the Free plan). Only names under one of `suffixes` are kept: the rest of a shared
+    address's names belong to other people. {ip: [names]}."""
+    if not _censys_platform():
+        return {}
+    sfx = [x.lstrip(".").lower() for x in suffixes if x.strip()]
+    out: Dict[str, List[str]] = {}
+    uniq = sorted(set(ips))
+    for k in range(0, len(uniq), 100):
+        if _censys_disabled.is_set():
+            break
+        chunk = uniq[k:k + 100]
+        res = _censys_platform_post("/asset/host", {"host_ids": chunk},
+                                    "application/vnd.censys.api.v3.host.v1+json",
+                                    f"lookup {k + 1}-{k + len(chunk)}", log)
+        for item in res or []:
+            r = item.get("resource") or {}
+            dns = r.get("dns") or {}
+            names = set(dns.get("names") or []) | set((dns.get("reverse_dns") or {}).get("names") or [])
+            keep = sorted({n for n in (normalize_host(str(x)) for x in names)
+                           if n and any(_in_scope(n, q) for q in sfx)})
+            if keep:
+                out[str(r.get("ip"))] = keep
+    return out
+
+
 def censys_hostnames(query: str, log=None) -> List[str]:
-    """Hostnames under `query` (a domain or a bare brand TLD like 'brand') from the
-    Censys legacy Search v2 hosts index, via a single dns.names aggregation call.
-    Quota-light: ~1 API call per query. Returns [] if no creds / on error."""
+    """Hostnames under `query` (a domain or a bare brand TLD like 'brand') from Censys:
+    the Platform API when CENSYS_API_TOKEN is set, else the legacy Search v2 hosts
+    index (one dns.names aggregation call). Returns [] if no creds / on error."""
+    if _censys_platform():
+        return censys_platform_hostnames(query, log)
     creds = _censys_creds()
     if not creds or _censys_disabled.is_set():
         return []
@@ -6108,13 +6274,14 @@ def enumerate_subdomains(apexes: List[str], subs_file: str, log,
             log("[subs] subfinder " + ("disabled" if not use_subfinder
                 else "not found") + " — using CertSpotter + Censys for discovery")
 
-        censys_ok = use_censys and _censys_creds() is not None
+        censys_ok = use_censys and censys_configured()
         cs_ok = use_certspotter
-        if not use_censys and _censys_creds() is not None:
+        if not use_censys and censys_configured():
             log("[censys] credentials present but Censys is opt-in — pass --censys to use it "
                 "(metered; see --censys-max)")
         if censys_ok:
-            log("[censys] credentials found — using Censys hosts index"
+            log("[censys] credentials found — using the Censys "
+                + ("Platform API" if _censys_platform() else "legacy Search v2 hosts index")
                 + ("" if ct_ok else " (crt.sh down, Censys is a primary CT source)"))
         if cs_ok:
             log("[certspotter] enabled" + (" (with token)" if _certspotter_token()
@@ -6337,7 +6504,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--ct-source db: domains per database query")
     p.add_argument("--censys", action="store_true",
                    help="Enable Censys hosts-index enumeration (opt-in: metered/credit-limited, "
-                        "needs CENSYS_API_ID/SECRET or a subfinder provider key; see --censys-max)")
+                        "needs CENSYS_API_TOKEN (+ CENSYS_ORG_ID for search) or legacy CENSYS_API_ID/SECRET; see --censys-max)")
     p.add_argument("--no-censys", action="store_true",
                    help="Force Censys off even if --censys is given (overrides --censys)")
     p.add_argument("--censys-max", type=int, default=0, metavar="N",

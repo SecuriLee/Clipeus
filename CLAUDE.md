@@ -49,5 +49,5 @@ clipeus.tuning.example.json    example operational tuning (copy -> clipeus.tunin
 clipeus.platforms.json         end-of-life / non-enterprise rules behind the platform_risk column (review `_as_of` regularly)
 clipeus                        venv-aware launcher
 pyproject.toml  requirements.txt
-recon/                         enum-bulk.sh + crtsh/nsec3/wildcard/posture/dns-exists helpers
+recon/                         enum-bulk.sh + crtsh/nsec3/wildcard/posture/dns-exists/censys-ip-names helpers
 ```

@@ -202,7 +202,7 @@ python3 clipeus.py --input big.txt --output big.jsonl --format jsonl \
 | `--no-ct` | off | Disable crt.sh CT enumeration |
 | `--ct-source web\|db` | `web` | Where crt.sh data comes from: the JSON API, or crt.sh's public PostgreSQL replica (see below) |
 | `--ct-db-batch N` | 20 | Domains per database query with `--ct-source db` |
-| `--censys` | off (opt-in) | Enable Censys hosts-index enumeration (metered/credit-limited) |
+| `--censys` | off (opt-in) | Enable Censys enumeration: Platform API (`CENSYS_API_TOKEN` + `CENSYS_ORG_ID`) or legacy Search v2 (metered/credit-limited) |
 | `--no-censys` | — | Force Censys off even if `--censys` is given |
 | `--censys-max N` | `0` (no cap) | Stop calling Censys after N API calls in this run |
 | `--ct-tld TLD` | — | Sweep an entire brand TLD via CT + Censys, e.g. `--ct-tld brand` (repeatable) |
@@ -256,19 +256,31 @@ tail -f /tmp/scan.log
 ### Subdomain enumeration & CT / Censys
 
 `--subs-file` runs a pre-pass that discovers subdomains via **subfinder** (batch)
-plus **certificate transparency** — crt.sh when reachable, and the **Censys** hosts
-index as a fallback/supplement (reads the key from
-`~/.config/subfinder/provider-config.yaml`, or `CENSYS_API_ID`/`CENSYS_API_SECRET`).
+plus **certificate transparency** — crt.sh when reachable — and, with `--censys`, **Censys**.
 Discovered subdomains are written live to the file **and folded into the audit**.
-**Censys limits.** Each in-scope registrable domain (and each `--ct-tld`) costs one call to the
-legacy Search v2 `hosts/aggregate` endpoint, with up to 3 retries on HTTP 429 (every attempt counts
-as a call). Use `--censys-max N` to stop after N calls — the run logs the total, and Censys is then
-skipped for the rest of the run. HTTP 401/402/403/410 (rejected key, exhausted credits, or the legacy API no longer
-offered to the account) disables Censys for the run immediately with one warning instead of one
-per domain. **Censys is opt-in:** it runs only when you pass `--censys` (credentials alone no longer
-enable it), because the current Censys plans are credit-limited. For mass runs leave it off and
-run a separate `--censys` pass over just the apex domains, bounded with `--censys-max`. The code still targets the legacy endpoint; moving to Censys's current platform API is
-pending confirmation of its endpoint, auth and quota.
+
+**Censys.** Two APIs are supported; credentials come only from the environment:
+
+| Credentials | API | Enumeration |
+|---|---|---|
+| `CENSYS_API_TOKEN` + `CENSYS_ORG_ID` (paid plan) | Platform API v3 | per domain, aggregations of `host.dns.names` and `web.hostname` matching the domain (2 calls) |
+| `CENSYS_API_TOKEN` alone (Free plan) | Platform API v3 | none: the Free plan allows asset lookups only, so search is switched off once with that reason; use `recon/censys-ip-names.py` |
+| `CENSYS_API_ID` / `CENSYS_API_SECRET` (or a subfinder provider key) | legacy Search v2 | one `hosts/aggregate` call per domain |
+
+The token wins when both are set. Platform calls run one at a time (the Free and Starter plans
+allow one concurrent action); HTTP 429 (concurrency) and 503 (request rate) are retried with
+backoff, and every attempt counts as a call. Use `--censys-max N` to stop after N calls; the run
+logs the total. HTTP 401/402/403 (and 410 on the legacy API) switch Censys off for the run with
+one warning instead of one per domain. **Censys is opt-in:** it runs only when you pass
+`--censys`, because the plans are credit-limited. For mass runs leave it off and run a separate
+`--censys` pass over just the apex domains, bounded with `--censys-max`.
+
+**Names on known addresses (Free plan).** `recon/censys-ip-names.py` asks Censys which DNS
+names point at each address (forward and reverse; up to 100 addresses per lookup call, billed per
+address) and keeps only names under the in-scope apexes, since a shared address carries other
+people's names too. Feed it an audit's `a_records` (`--from-audit`, optionally `--skip-cdn`) or a
+list (`--input`); `--known` leaves out names already targeted; `--dry-run` shows the address and
+call count first.
 
 `--ct-tld brand` sweeps an entire brand gTLD — the only practical way to enumerate
 `*.brand`, since there's no zone transfer or brute-forceable namespace.
