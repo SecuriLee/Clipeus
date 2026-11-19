@@ -42,6 +42,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import smtplib
 import ssl
 import sys
@@ -155,7 +156,33 @@ def snapshot(rec: Dict[str, Any]) -> Dict[str, Any]:
     if ("ports" in snap and checks.get("ports") == "not_applicable"
             and str(rec.get("cdn", "No")) not in ("No", "", "N/A", "None")):
         snap["ports"] = PORTS_CDN
+    if rec.get("score_notes") not in (None, "", "N/A"):
+        snap["score_notes"] = rec["score_notes"]    # explains risk changes; never compared
     return snap
+
+
+_NOTE_SPLIT = re.compile(r";\s+(?![^()]*\))")
+_NOTE_POINTS = re.compile(r"\s*\(\+\d+[^()]*\)$")
+
+
+def score_reasons(old_notes: Any, new_notes: Any) -> List[str]:
+    """What moved the risk score, in words: '+ <reason> (+N)' for each reason scored now
+    but not before, '- <reason> (+N)' for each one that went. Reasons are matched without
+    their points. With no earlier breakdown (state from an older version) the whole
+    current breakdown is listed as '= <reason>'."""
+    def parse(v: Any) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for n in _NOTE_SPLIT.split(str(v or "")):
+            n = n.strip()
+            if n and n not in ("N/A", "None"):
+                out[_NOTE_POINTS.sub("", n)] = n
+        return out
+    new = parse(new_notes)
+    if old_notes is None:
+        return [f"= {n}" for n in new.values()]
+    old = parse(old_notes)
+    return ([f"+ {n}" for k, n in new.items() if k not in old]
+            + [f"- {n}" for k, n in old.items() if k not in new])
 
 
 _LOCAL_NETS = tuple(ipaddress.ip_network(n) for n in (
@@ -200,14 +227,15 @@ DEAD_DISPOSITIONS = ("dead-dns", "dead-nohttp")
 
 
 def hold_dead(entry: Dict[str, Any], new: Dict[str, Any]) -> bool:
-    """A host that answered last run and looks dead now, with its DNS and takeover
-    verdict unchanged, is more often a dropped connection than a real outage. Keep
-    the last snapshot until the next run agrees. Mutates entry['pending_dead'];
+    """A host that answered last run and looks dead now, with its takeover verdict
+    unchanged and DNS either still answering or timing out (a lookup that got no
+    answer, not an answer saying the name is gone), is more often a dropped connection
+    than a real outage. Keep the last snapshot until the next run agrees. Mutates entry['pending_dead'];
     returns True when this run's result is held back."""
     old = entry.get("snapshot", {})
     suspect = (new.get("disposition") in DEAD_DISPOSITIONS
                and old.get("disposition") not in (None, *DEAD_DISPOSITIONS)
-               and new.get("dns_status") == old.get("dns_status") == "OK"
+               and old.get("dns_status") == "OK" and new.get("dns_status") in ("OK", "TIMEOUT")
                and new.get("takeover_outcome") == old.get("takeover_outcome")
                and new.get("takeover_risk") == old.get("takeover_risk"))
     if suspect and not entry.get("pending_dead"):
@@ -337,6 +365,8 @@ def compare(host: str, tier: str, old: Dict[str, Any], new: Dict[str, Any]) -> L
     if d >= 20:
         add("warning", "risk-increased", f"risk score +{d} ({old.get('risk_score')} -> {new.get('risk_score')})",
             "risk_score", old.get("risk_score"), new.get("risk_score"))
+        ev[-1]["reasons"] = score_reasons(old.get("score_notes") if "score_notes" in old else None,
+                                          new.get("score_notes"))
     if private_only(new) and not any(e["kind"] in ("takeover-risk", "abusive-content", "ns-domain-registered",
                                                    "claimable-resource", "claimable-mx")
                                      for e in ev):
@@ -461,6 +491,8 @@ def email_body(text: str, events: List[Dict[str, Any]]) -> str:
         out += ["", f"{e['host']}  [{e['severity']}, {e['tier']} tier]", f"  {e['kind']}: {e['detail']}"]
         if e.get("field") and (e.get("before") is not None or e.get("after") is not None):
             out += [f"  {e['field']} before: {e.get('before')}", f"  {e['field']} after:  {e.get('after')}"]
+        if e.get("reasons"):
+            out += ["  why:"] + [f"    {r}" for r in e["reasons"]]
     out += ["", "--", "Sent by Clipeus watch mode. The full event log is kept on the scanning host."]
     return "\n".join(out)
 
@@ -530,6 +562,14 @@ def email_html(text: str, events: List[Dict[str, Any]]) -> str:
                         row.append(f'<tr><td style="{cell};color:#667085">delta</td>'
                                    f'<td style="{cell}">{h(delta)}</td></tr>')
                 row.append('</table>')
+            if e.get("reasons"):
+                head = ("score made of (earlier breakdown not recorded)"
+                        if e["reasons"][0].startswith("=") else "why")
+                items = "".join(
+                    f'<li style="margin:2px 0;color:{"#b42318" if r[0] == "+" else "#067647" if r[0] == "-" else "#344054"}">'
+                    f'{h({"+": "added: ", "-": "gone: "}.get(r[0], "") + r[2:])}</li>' for r in e["reasons"])
+                row.append(f'<div style="margin-top:8px;font-size:13px;color:#667085">{h(head)}</div>'
+                           f'<ul style="margin:4px 0 0 18px;padding:0;font-size:13px">{items}</ul>')
             row.append('</td></tr>')
             out.append("".join(row))
         out.append('</table></td></tr>')
@@ -874,7 +914,8 @@ def run(args: Any, alerts_cfg: Dict[str, Any], log: Callable[[str], None],
     save_state(state_path, st)
 
     for e in sorted(events, key=lambda e: (-_SEV[e["severity"]], e["host"])):
-        log(f"[watch] [{e['severity']}] {e['host']} ({e['tier']}): {e['kind']} — {e['detail']}")
+        log(f"[watch] [{e['severity']}] {e['host']} ({e['tier']}): {e['kind']} — {e['detail']}"
+            + (f" — why: {'; '.join(e['reasons'])}" if e.get("reasons") else ""))
     failed = dispatch(events, alerts, log, ",".join(want))
     floor = _SEV.get(alerts.get("min_severity", "warning"), 1)
     loud = sum(1 for e in events if _SEV[e["severity"]] >= floor)

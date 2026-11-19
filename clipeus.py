@@ -45,7 +45,7 @@ See README.md for the full option and dependency reference.
 
 from __future__ import annotations
 
-__version__ = "26.11.12"
+__version__ = "26.11.13"
 
 import argparse
 import base64
@@ -5484,8 +5484,29 @@ def selftest() -> int:
         entry = {"snapshot": _w.snapshot(live)}
         d3 = _w.hold_dead(entry, _w.snapshot({**dead, "takeover_outcome": "claimable-by-policy",
                                                "takeover_risk": "Yes"}))
-        check(d1 and not d2 and not d3,
-              "watch: one dead result after a live one is held; a second confirms; a takeover change is never held")
+        entry = {"snapshot": _w.snapshot({**live, "dns_status": "OK"})}
+        d4 = _w.hold_dead(entry, _w.snapshot({**dead, "disposition": "dead-dns", "dns_status": "TIMEOUT"}))
+        entry = {"snapshot": _w.snapshot({**live, "dns_status": "OK"})}
+        d5 = _w.hold_dead(entry, _w.snapshot({**dead, "disposition": "dead-dns", "dns_status": "NXDOMAIN"}))
+        check(d1 and not d2 and not d3 and d4 and not d5,
+              "watch: one dead result after a live one is held (a DNS timeout too, never NXDOMAIN); "
+              "a second confirms; a takeover change is never held")
+        hyg = "SPF missing/invalid/permissive (+20); TLS unhealthy (self-signed;hostname-mismatch) (+15)"
+        r0 = _w.snapshot({**live, "risk_score": 35, "score_notes": hyg})
+        r1 = _w.snapshot({**live, "risk_score": 75, "score_notes": hyg + "; Login page outside org networks"
+                          " and managed providers (+30); Admin login path exposed (+10)"})
+        ev = [e for e in _w.compare("h.example", "elevated", r0, r1) if e["kind"] == "risk-increased"]
+        legacy = {k: v for k, v in r0.items() if k != "score_notes"}
+        ev_l = [e for e in _w.compare("h.example", "elevated", legacy, r1) if e["kind"] == "risk-increased"]
+        same = _w.compare("h.example", "elevated", r0, {**r0, "score_notes": "TLS unhealthy (x) (+15)"})
+        txt = _w.email_body("t", ev)
+        check(ev and ev[0]["reasons"] == ["+ Login page outside org networks and managed providers (+30)",
+                                          "+ Admin login path exposed (+10)"]
+              and "why:" in txt and "Admin login path exposed (+10)" in txt
+              and "added: Admin login path" in _w.email_html("t", ev)
+              and len(ev_l[0]["reasons"]) == 4 and ev_l[0]["reasons"][0].startswith("= ")
+              and not same,
+              "watch: a risk increase says which reasons were added; the breakdown alone never alerts")
         # ---- third-party resources (26.11.8), offline: DNS / RDAP / HTTP are fakes
         page = ('<base href="https://www.example.com/app/">'
                 '<script src="https://cdn.vendor.example/a.js" integrity="sha384-x"></script>'

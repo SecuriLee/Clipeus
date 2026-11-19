@@ -806,7 +806,15 @@ so a record that is fixed and broken again is still seen.
 
 A field whose check did not run in either record (for example ports with `--ports none`)
 is not compared, so "not looked at" never reads as "gone"; nor is the output of a check
-that failed (for example a filter answering every port). Further noise guards:
+that failed (for example a filter answering every port).
+
+A risk-score increase says why: the alert lists each scoring reason that was added
+(`+ Login page outside org networks and managed providers (+30)`) or went away (`- ...`),
+from the record's `score_notes`. The breakdown is kept in the watch state but never
+alerts on its own. State written before this existed has no earlier breakdown; the first
+increase then lists the whole current one (`= ...`).
+
+Further noise guards:
 
 - Address, nameserver and port lists are compared as sets: the same records in another order are no change.
 - A move inside the provider the name already uses is info, not a warning: the first CNAME hop is unchanged
@@ -821,8 +829,8 @@ that failed (for example a filter answering every port). Further noise guards:
 - Ports are not scanned behind a CDN; the snapshot records `not scanned (CDN)` rather than an empty
   list, so "not scanned" and "nothing open" stay apart, and a host leaving its CDN reads
   `not scanned (CDN) -> 80,443`.
-- A host that answered last run and looks dead now (`dead-dns` / `dead-nohttp`) with its DNS status and
-  takeover verdict unchanged keeps its last state for one run; the outage is reported when the next run agrees.
+- A host that answered last run and looks dead now (`dead-dns` / `dead-nohttp`) with its takeover
+  verdict unchanged and DNS still answering or timing out (never NXDOMAIN) keeps its last state for one run; the outage is reported when the next run agrees.
 - A host that gives no result within `watch_host_timeout` seconds (tuning, default 300; slow, filtered or
   tarpitted) is skipped for that run with its state kept; three timeouts in a row are logged.
 
